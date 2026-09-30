@@ -5036,13 +5036,9 @@ static drflac_bool32 drflac__decode_samples_with_residual(drflac_bs* bs, drflac_
     }
 
     /*
-    From the FLAC spec:
-      The Rice partition order in a Rice-coded residual section must be less than or equal to 8.
+    The order's 4 bits allow up to 15. Only the streamable subset limits it to 8 (RFC 9639 sections 7 and 9.2.7), and the check below keeps
+    every partition inside the block.
     */
-    if (partitionOrder > 8) {
-        return DRFLAC_FALSE;
-    }
-
     /* Validation check. The partitions must divide the block evenly, or the samples past the last whole partition are never written. */
     if ((blockSize / (1 << partitionOrder)) < lpcOrder || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
@@ -5127,13 +5123,9 @@ static drflac_bool32 drflac__read_and_seek_residual(drflac_bs* bs, drflac_uint32
     }
 
     /*
-    From the FLAC spec:
-      The Rice partition order in a Rice-coded residual section must be less than or equal to 8.
+    The order's 4 bits allow up to 15. Only the streamable subset limits it to 8 (RFC 9639 sections 7 and 9.2.7), and the check below keeps
+    every partition inside the block.
     */
-    if (partitionOrder > 8) {
-        return DRFLAC_FALSE;
-    }
-
     /* Validation check. This must match drflac__decode_samples_with_residual(): the first partition can legally hold no residuals. */
     if ((blockSize / (1 << partitionOrder)) < order || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
@@ -5421,7 +5413,7 @@ static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_sub
     if (!drflac__read_uint8(bs, 2, &residualMethod) || (residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE && residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE2)) {
         return DRFLAC_FALSE;
     }
-    if (!drflac__read_uint8(bs, 4, &partitionOrder) || partitionOrder > 8 || (blockSize >> partitionOrder) < order || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
+    if (!drflac__read_uint8(bs, 4, &partitionOrder) || (blockSize >> partitionOrder) < order || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
     }
 
