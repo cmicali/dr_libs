@@ -1854,15 +1854,14 @@ DRWAV_PRIVATE drwav_int64 drwav_aiff_extented_to_s64(const drwav_uint8* data)
         return sign ? DRWAV_INT64_MIN : DRWAV_INT64_MAX;    /* Infinite. */
     }
 
-    exponent -= 16383;
-
-    if (exponent > 63) {
+    /* The unbiased exponent, signed: below 0 the number is less than 1, and from 63 up its integer part needs all 64 bits or more. */
+    if ((drwav_int32)exponent - 16383 >= 63) {
         return sign ? DRWAV_INT64_MIN : DRWAV_INT64_MAX;    /* Too big for a 64-bit integer. */
-    } else if (exponent < 1) {
+    } else if ((drwav_int32)exponent - 16383 < 0) {
         return 0;  /* Number is less than 1, so rounds down to 0. */
     }
 
-    significand >>= (63 - exponent);
+    significand >>= (63 - ((drwav_int32)exponent - 16383));   /* Less than 2^63, so it fits. */
 
     if (sign) {
         return -(drwav_int64)significand;
