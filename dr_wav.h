@@ -4078,7 +4078,21 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
                 framesInDataKnown = DRWAV_FALSE;
             } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
-                framesInData = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
+                /*
+                An MS ADPCM block's header is 7 bytes a channel and holds two decoded frames, and each byte after it two samples. A
+                block cut short holds its header's frames only once the whole header is there, so a header cut short counts for none.
+                */
+                drwav_uint64 headerSizeInBytes = 7 * (drwav_uint64)fmt.channels;
+                drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
+
+                if (fmt.blockAlign < headerSizeInBytes) {
+                    framesInDataKnown = DRWAV_FALSE;
+                } else {
+                    framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - headerSizeInBytes) * 2) / fmt.channels) + 2);
+                    if (bytesInPartialBlock >= headerSizeInBytes) {
+                        framesInData += 2 + ((bytesInPartialBlock - headerSizeInBytes) * 2) / fmt.channels;
+                    }
+                }
             } else {
                 /*
                 An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample, and the
