@@ -6058,11 +6058,12 @@ DRWAV_API drwav_uint64 drwav_read_pcm_frames(drwav* pWav, drwav_uint64 framesToR
 
     /*
     Here is where we check if we need to do a signed/unsigned conversion for AIFF. The reason we need to do this
-    is because dr_wav always assumes an 8-bit sample is unsigned, whereas AIFF can have signed 8-bit formats.
+    is because dr_wav always assumes an 8-bit sample is unsigned, whereas AIFF can have signed 8-bit formats. A-law and
+    mu-law bytes are codes, not samples, so they are left alone.
     */
     post_process:
     {
-        if (pWav->container == drwav_container_aiff && pWav->bitsPerSample == 8 && pWav->aiff.isUnsigned == DRWAV_FALSE) {
+        if (pWav->container == drwav_container_aiff && pWav->bitsPerSample == 8 && pWav->aiff.isUnsigned == DRWAV_FALSE && pWav->translatedFormatTag == DR_WAVE_FORMAT_PCM) {
             if (pBufferOut != NULL) {
                 drwav_uint64 iSample;
 
