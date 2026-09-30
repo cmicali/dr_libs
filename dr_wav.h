@@ -4101,6 +4101,20 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         }
     }
 
+    /*
+    A WAV ADPCM block must hold its header, and an IMA ADPCM one whole groups of 4 bytes a channel after it: the readers count a block's
+    bytes down by header and group, and a count that went below 0 would wrap, and the blocks after it be read out of step.
+    */
+    if (pWav->container != drwav_container_aiff) {
+        drwav_uint32 blockAlign = fmt.blockAlign;
+        drwav_uint32 channels   = fmt.channels;
+        if ((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM     &&  blockAlign <  7 * channels) ||
+            (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && (blockAlign <= 4 * channels || (blockAlign - 4 * channels) % (4 * channels) != 0))) {
+            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE;
+        }
+    }
+
     /* The number of bytes per frame must be known. If not, it's an invalid file and not decodable. */
     if (drwav_get_bytes_per_pcm_frame(pWav) == 0) {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
@@ -6253,7 +6267,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_seek_to_first_pcm_frame(drwav* pWav)
         return DRWAV_FALSE; /* No seeking in write mode. */
     }
 
-    if (!pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos, DRWAV_SEEK_SET)) {
+    if (!drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos, pWav->pUserData)) {
         return DRWAV_FALSE;
     }
 
