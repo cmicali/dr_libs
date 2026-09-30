@@ -697,6 +697,9 @@ typedef struct
     drflac_uint64 _lostPCMFramesRemaining;
     drflac_frame_header _frameHeaderAfterLoss;
 
+    /* Internal use only. The block size the frame numbers of a fixed block size stream count in. */
+    drflac_uint16 _fixedBlockSizeInPCMFrames;
+
     /* Internal use only. The 33-bit side channel of a frame of a 32-bit stereo stream, or NULL for any other stream. This is an offset of pExtraData. */
     drflac_int64* _pSideSamplesS64;
 
@@ -6056,7 +6059,7 @@ static void drflac__get_pcm_frame_range_of_current_flac_frame(drflac* pFlac, drf
 
     firstPCMFrame = pFlac->currentFLACFrame.header.pcmFrameNumber;
     if (firstPCMFrame == 0) {
-        firstPCMFrame = ((drflac_uint64)pFlac->currentFLACFrame.header.flacFrameNumber) * pFlac->maxBlockSizeInPCMFrames;
+        firstPCMFrame = ((drflac_uint64)pFlac->currentFLACFrame.header.flacFrameNumber) * pFlac->_fixedBlockSizeInPCMFrames;
     }
 
     lastPCMFrame = firstPCMFrame + pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
@@ -6590,6 +6593,7 @@ typedef struct
     drflac_uint8  channels;
     drflac_uint8  bitsPerSample;
     drflac_uint64 totalPCMFrameCount;
+    drflac_uint16 minBlockSizeInPCMFrames;
     drflac_uint16 maxBlockSizeInPCMFrames;
     drflac_uint64 runningFilePos;
     drflac_bool32 hasStreamInfoBlock;
@@ -7344,6 +7348,7 @@ static drflac_bool32 drflac__init_private__native(drflac_init_info* pInit, drfla
             pInit->sampleRate              = pInit->firstFrameHeader.sampleRate;
             pInit->channels                = drflac__get_channel_count_from_channel_assignment(pInit->firstFrameHeader.channelAssignment);
             pInit->bitsPerSample           = pInit->firstFrameHeader.bitsPerSample;
+            pInit->minBlockSizeInPCMFrames = pInit->firstFrameHeader.blockSizeInPCMFrames;
             pInit->maxBlockSizeInPCMFrames = 65535;   /* <-- See notes here: https://xiph.org/flac/format.html#metadata_block_streaminfo */
             return DRFLAC_TRUE;
         }
@@ -7358,7 +7363,8 @@ static drflac_bool32 drflac__init_private__native(drflac_init_info* pInit, drfla
         pInit->channels                = streaminfo.channels;
         pInit->bitsPerSample           = streaminfo.bitsPerSample;
         pInit->totalPCMFrameCount      = streaminfo.totalPCMFrameCount;
-        pInit->maxBlockSizeInPCMFrames = streaminfo.maxBlockSizeInPCMFrames;    /* Don't care about the min block size - only the max (used for determining the size of the memory allocation). */
+        pInit->minBlockSizeInPCMFrames = streaminfo.minBlockSizeInPCMFrames;
+        pInit->maxBlockSizeInPCMFrames = streaminfo.maxBlockSizeInPCMFrames;
         pInit->hasMetadataBlocks       = !isLastBlock;
 
         if (onMeta) {
@@ -8172,6 +8178,7 @@ static drflac_bool32 drflac__init_private__ogg(drflac_init_info* pInit, drflac_r
                             pInit->channels                = streaminfo.channels;
                             pInit->bitsPerSample           = streaminfo.bitsPerSample;
                             pInit->totalPCMFrameCount      = streaminfo.totalPCMFrameCount;
+                            pInit->minBlockSizeInPCMFrames = streaminfo.minBlockSizeInPCMFrames;
                             pInit->maxBlockSizeInPCMFrames = streaminfo.maxBlockSizeInPCMFrames;
                             pInit->hasMetadataBlocks       = !isLastBlock;
 
@@ -8332,6 +8339,15 @@ static void drflac__init_from_info(drflac* pFlac, const drflac_init_info* pInit)
     pFlac->onMeta                  = pInit->onMeta;
     pFlac->pUserDataMD             = pInit->pUserDataMD;
     pFlac->maxBlockSizeInPCMFrames = pInit->maxBlockSizeInPCMFrames;
+
+    /*
+    Every frame of a fixed block size stream but the last has STREAMINFO's minimum block size, which is what a frame number counts in. The
+    maximum should be the same, but isn't always.
+    */
+    pFlac->_fixedBlockSizeInPCMFrames = pInit->minBlockSizeInPCMFrames;
+    if (pFlac->_fixedBlockSizeInPCMFrames == 0 || pFlac->_fixedBlockSizeInPCMFrames > pFlac->maxBlockSizeInPCMFrames) {
+        pFlac->_fixedBlockSizeInPCMFrames = pFlac->maxBlockSizeInPCMFrames;
+    }
     pFlac->sampleRate              = pInit->sampleRate;
     pFlac->channels                = (drflac_uint8)pInit->channels;
     pFlac->bitsPerSample           = (drflac_uint8)pInit->bitsPerSample;
