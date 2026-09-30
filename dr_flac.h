@@ -5258,7 +5258,7 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             }
             crc8 = drflac_crc8(crc8, header->blockSizeInPCMFrames, 16);
             if (header->blockSizeInPCMFrames == 0xFFFF) {
-                return DRFLAC_FALSE;    /* Frame is too big. This is the size of the frame minus 1. The STREAMINFO block defines the max block size which is 16-bits. Adding one will make it 17 bits and therefore too big. */
+                continue;   /* Frame is too big. This is the size of the frame minus 1. The STREAMINFO block defines the max block size which is 16-bits. Adding one will make it 17 bits and therefore too big. Assume an invalid block. */
             }
             header->blockSizeInPCMFrames += 1;
         } else {
@@ -5298,9 +5298,9 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             header->bitsPerSample = streaminfoBitsPerSample;
         }
 
-        if (header->bitsPerSample != streaminfoBitsPerSample) {
-            /* If this subframe has a different bitsPerSample then streaminfo or the first frame, reject it */
-            return DRFLAC_FALSE;
+        if (streaminfoBitsPerSample != 0 && header->bitsPerSample != streaminfoBitsPerSample) {
+            /* If this frame has a different bitsPerSample than streaminfo it cannot belong to the stream, so it's a false sync code or a damaged header. Keep looking. */
+            continue;
         }
 
         if (!drflac__read_uint8(bs, 8, &header->crc8)) {
