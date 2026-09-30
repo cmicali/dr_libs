@@ -6193,14 +6193,21 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
         }
     } else {
         /* Slower case. Seek to the start of the seekpoint and then seek forward from there. */
-        runningPCMFrameCount = pFlac->pSeekpoints[iClosestSeekpoint].firstPCMFrame;
-
         if (!drflac__seek_to_byte(&pFlac->bs, pFlac->firstFLACFramePosInBytes + pFlac->pSeekpoints[iClosestSeekpoint].flacFrameOffset)) {
             return DRFLAC_FALSE;
         }
 
         /* Grab the frame the seekpoint is sitting on in preparation for the sample-exact seeking below. */
         if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            return DRFLAC_FALSE;
+        }
+
+        /*
+        Count from the first PCM frame of the frame the seekpoint points at, not from the seekpoint's own PCM frame. A seek table left
+        stale by an edit can be several frames out, and counting from it would land that far from the target while reporting the target.
+        */
+        drflac__get_pcm_frame_range_of_current_flac_frame(pFlac, &runningPCMFrameCount, NULL);
+        if (runningPCMFrameCount > pcmFrameIndex) {
             return DRFLAC_FALSE;
         }
     }
