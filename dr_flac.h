@@ -7705,6 +7705,9 @@ static drflac_bool32 drflac_oggbs__goto_next_page(drflac_oggbs* oggbs, drflac_og
 #ifndef DR_FLAC_NO_CRC
         actualCRC32 = drflac_crc32_buffer(crc32, oggbs->pageData, oggbs->pageDataSize);
         if (actualCRC32 != header.checksum) {
+            /* The page's data has replaced the previous page's, so none of that is left to read. */
+            oggbs->bytesRemainingInPage = 0;
+
             if (recoveryMethod == drflac_ogg_recover_on_crc_mismatch) {
                 continue;   /* CRC mismatch. Skip this page. */
             } else {
