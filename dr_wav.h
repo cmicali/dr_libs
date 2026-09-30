@@ -3677,10 +3677,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             offset = drwav_bytes_to_u32_ex(offsetAndBlockSizeData + 0, pWav->container);
             pWav->dataChunkDataPos = cursor + offset;
 
-            /* The data chunk size needs to be reduced by the offset or else seeking will break. */
+            /* The data chunk size needs to be reduced by the offset and block size fields, and by the offset, or else seeking will break. */
             dataChunkSize = chunkSize;
-            if (dataChunkSize  > offset) {
-                dataChunkSize -= offset;
+            if (dataChunkSize  > sizeof(offsetAndBlockSizeData) + (drwav_uint64)offset) {
+                dataChunkSize -= sizeof(offsetAndBlockSizeData) + (drwav_uint64)offset;
             } else {
                 dataChunkSize = 0;
             }
