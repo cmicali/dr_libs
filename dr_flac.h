@@ -2627,17 +2627,18 @@ static drflac_bool32 drflac__find_and_seek_to_next_sync_code(drflac_bs* bs)
         }
 
         if (hi == 0xFF) {
-            drflac_uint8 lo;
-            if (!drflac__read_uint8(bs, 6, &lo)) {
+            /*
+            The next byte is looked at before it's read. If it doesn't finish a sync code it can start one itself, as the 0xFF of a
+            frame's sync code does when the frame before it ends with a CRC-16 whose low byte is 0xFF.
+            */
+            if (DRFLAC_CACHE_L1_BITS_REMAINING(bs) == 0 && !drflac__reload_cache(bs)) {
                 return DRFLAC_FALSE;
             }
 
-            if (lo == 0x3E) {
+            if (DRFLAC_CACHE_L1_SELECT_AND_SHIFT(bs, 6) == 0x3E) {
+                bs->consumedBits += 6;
+                bs->cache <<= 6;
                 return DRFLAC_TRUE;
-            } else {
-                if (!drflac__seek_bits(bs, DRFLAC_CACHE_L1_BITS_REMAINING(bs) & 7)) {
-                    return DRFLAC_FALSE;
-                }
             }
         }
     }
