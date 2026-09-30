@@ -5792,6 +5792,7 @@ static DRFLAC_INLINE drflac_uint8 drflac__get_channel_count_from_channel_assignm
 
 static drflac_result drflac__decode_flac_frame(drflac* pFlac)
 {
+    drflac_result result;
     int channelCount;
     int i;
     drflac_uint8 paddingSizeInBits;
@@ -5817,7 +5818,8 @@ static drflac_result drflac__decode_flac_frame(drflac* pFlac)
 
     for (i = 0; i < channelCount; ++i) {
         if (!drflac__decode_subframe(&pFlac->bs, &pFlac->currentFLACFrame, i, pFlac->pDecodedSamples + (pFlac->currentFLACFrame.header.blockSizeInPCMFrames * i), pFlac->_pSideSamplesS64)) {
-            return DRFLAC_ERROR;
+            result = DRFLAC_ERROR;
+            goto error;
         }
     }
 
@@ -5829,7 +5831,8 @@ static drflac_result drflac__decode_flac_frame(drflac* pFlac)
     if (paddingSizeInBits > 0) {
         drflac_uint8 padding = 0;
         if (!drflac__read_uint8(&pFlac->bs, paddingSizeInBits, &padding)) {
-            return DRFLAC_AT_END;
+            result = DRFLAC_AT_END;
+            goto error;
         }
     }
 
@@ -5837,18 +5840,25 @@ static drflac_result drflac__decode_flac_frame(drflac* pFlac)
     actualCRC16 = drflac__flush_crc16(&pFlac->bs);
 #endif
     if (!drflac__read_uint16(&pFlac->bs, 16, &desiredCRC16)) {
-        return DRFLAC_AT_END;
+        result = DRFLAC_AT_END;
+        goto error;
     }
 
 #ifndef DR_FLAC_NO_CRC
     if (actualCRC16 != desiredCRC16) {
-        return DRFLAC_CRC_MISMATCH;    /* CRC mismatch. */
+        result = DRFLAC_CRC_MISMATCH;    /* CRC mismatch. */
+        goto error;
     }
 #endif
 
     pFlac->currentFLACFrame.pcmFramesRemaining = pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
 
     return DRFLAC_SUCCESS;
+
+error:
+    /* The samples of a frame that failed must not be read, and the pointers are how drflac__is_current_flac_frame_valid() can tell. */
+    DRFLAC_ZERO_MEMORY(pFlac->currentFLACFrame.subframes, sizeof(pFlac->currentFLACFrame.subframes));
+    return result;
 }
 
 static drflac_result drflac__seek_flac_frame(drflac* pFlac)
@@ -10188,6 +10198,11 @@ static drflac_bool32 drflac__is_current_flac_frame_valid(drflac* pFlac)
     drflac_uint32 iChannel;
 
     if (pFlac->currentFLACFrame.header.blockSizeInPCMFrames > pFlac->maxBlockSizeInPCMFrames || pFlac->currentFLACFrame.pcmFramesRemaining > pFlac->currentFLACFrame.header.blockSizeInPCMFrames) {
+        return DRFLAC_FALSE;
+    }
+
+    /* The read functions take the channel count from the header, so it has to be the one the subframes were decoded for. */
+    if (pFlac->currentFLACFrame.header.channelAssignment > DRFLAC_CHANNEL_ASSIGNMENT_MID_SIDE || drflac__get_channel_count_from_channel_assignment(pFlac->currentFLACFrame.header.channelAssignment) != pFlac->channels) {
         return DRFLAC_FALSE;
     }
 
