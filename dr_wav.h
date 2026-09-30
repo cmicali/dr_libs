@@ -3114,6 +3114,29 @@ DRWAV_PRIVATE drwav_bool32 drwav_preinit(drwav* pWav, drwav_read_proc onRead, dr
     return DRWAV_TRUE;
 }
 
+/* Whether the bytes at a position look like a RIFF chunk header: a printable ID and a size that fits in the file. Leaves the stream anywhere. */
+DRWAV_PRIVATE drwav_bool32 drwav__is_chunk_header_at(drwav* pWav, drwav_uint64 position, drwav_uint64 fileSize)
+{
+    drwav_uint8 header[8];
+    int i;
+
+    if (position > fileSize || fileSize - position < sizeof(header)) {
+        return DRWAV_FALSE;
+    }
+
+    if (drwav__seek_from_start(pWav->onSeek, position, pWav->pUserData) == DRWAV_FALSE || pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
+        return DRWAV_FALSE;
+    }
+
+    for (i = 0; i < 4; i += 1) {
+        if (header[i] < 0x20 || header[i] > 0x7E) {
+            return DRWAV_FALSE;
+        }
+    }
+
+    return drwav_bytes_to_u32_ex(header + 4, pWav->container) <= fileSize - position - sizeof(header);
+}
+
 DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc onChunk, void* pChunkUserData, drwav_uint32 flags)
 {
     /* This function assumes drwav_preinit() has been called beforehand. */
@@ -3828,9 +3851,25 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     if (pWav->onTell != NULL && pWav->onSeek != NULL) {
         if (pWav->onSeek(pWav->pUserData, 0, DRWAV_SEEK_END) == DRWAV_TRUE) {
             drwav_int64 fileSize;
-            if (pWav->onTell(pWav->pUserData, &fileSize)) {
-                if (dataChunkSize + pWav->dataChunkDataPos > (drwav_uint64)fileSize) {
-                    dataChunkSize = (drwav_uint64)fileSize - pWav->dataChunkDataPos;
+            if (pWav->onTell(pWav->pUserData, &fileSize) && fileSize >= 0 && (drwav_uint64)fileSize >= pWav->dataChunkDataPos) {
+                drwav_uint64 bytesAfterDataPos = (drwav_uint64)fileSize - pWav->dataChunkDataPos;
+
+                /*
+                A RIFF data chunk's 32-bit size can't describe the audio of a recording that was never finalized, which its writer
+                leaves at 0 or 0xFFFFFFFF, or of one past 4 GB, whose size wraps. The audio is then the rest of the file, or the declared
+                size plus the whole multiples of 4 GB the file holds past it, as long as what follows the declared size isn't a chunk.
+                */
+                if ((pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && !sequential) {
+                    if (dataChunkSize == 0xFFFFFFFF || (dataChunkSize == 0 && bytesAfterDataPos > 0 && !drwav__is_chunk_header_at(pWav, pWav->dataChunkDataPos, (drwav_uint64)fileSize))) {
+                        dataChunkSize = bytesAfterDataPos;
+                    } else if (bytesAfterDataPos > dataChunkSize && bytesAfterDataPos - dataChunkSize >= ((drwav_uint64)1 << 32) &&
+                               !drwav__is_chunk_header_at(pWav, pWav->dataChunkDataPos + dataChunkSize + (dataChunkSize & 1), (drwav_uint64)fileSize)) {
+                        dataChunkSize += ((bytesAfterDataPos - dataChunkSize) >> 32) << 32;
+                    }
+                }
+
+                if (dataChunkSize > bytesAfterDataPos) {
+                    dataChunkSize = bytesAfterDataPos;
                 }
             }
         } else {
@@ -3839,15 +3878,16 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             this case we cannot perform the validation check.
             */
         }
-    }
+    } else if (dataChunkSize == 0xFFFFFFFF && (pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && !sequential) {
+        /*
+        With no way to find the file's size, the rest of the file is taken to be audio data, counted by reading and discarding it
+        from the start of the data.
+        */
+        if (drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos, pWav->pUserData) == DRWAV_FALSE) {
+            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE;
+        }
 
-    /*
-    I've seen a WAV file in the wild where a RIFF-ecapsulated file has the size of it's "RIFF" and
-    "data" chunks set to 0xFFFFFFFF when the file is definitely not that big. In this case we're
-    going to have to calculate the size by reading and discarding bytes, and then seeking back. We
-    cannot do this in sequential mode. We just assume that the rest of the file is audio data.
-    */
-    if (dataChunkSize == 0xFFFFFFFF && (pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && pWav->isSequentialWrite == DRWAV_FALSE) {
         dataChunkSize = 0;
 
         for (;;) {
