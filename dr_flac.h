@@ -554,6 +554,15 @@ typedef struct
     drflac_uint16 crc16;
     drflac_cache_t crc16Cache;              /* A cache for optimizing CRC calculations. This is filled when when the L1 cache is reloaded. */
     drflac_uint32 crc16CacheIgnoredBytes;   /* The number of bytes to ignore when updating the CRC-16 from the CRC-16 cache. */
+
+    /*
+    The position of the client's read cursor, just past the last byte read into the caches. drflac__seek_to_byte() sets it to the
+    absolute position; before the first such seek only differences between positions taken from it mean anything.
+    */
+    drflac_uint64 clientPos;
+
+    /* Whether a read has run out of data. Cleared when the cache is reset. */
+    drflac_bool32 isExhausted;
 } drflac_bs;
 
 typedef struct
@@ -2248,6 +2257,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__reload_l1_cache_from_l2(drflac_bs* bs
     }
 
     bytesRead = bs->onRead(bs->pUserData, bs->cacheL2, DRFLAC_CACHE_L2_SIZE_BYTES(bs));
+    bs->clientPos += bytesRead;
 
     bs->nextL2Line = 0;
     if (bytesRead == DRFLAC_CACHE_L2_SIZE_BYTES(bs)) {
@@ -2315,6 +2325,7 @@ static drflac_bool32 drflac__reload_cache(drflac_bs* bs)
     bytesRead = bs->unalignedByteCount;
     if (bytesRead == 0) {
         bs->consumedBits = DRFLAC_CACHE_L1_SIZE_BITS(bs);   /* <-- The stream has been exhausted, so marked the bits as consumed. */
+        bs->isExhausted  = DRFLAC_TRUE;
         return DRFLAC_FALSE;
     }
 
@@ -2339,11 +2350,19 @@ static void drflac__reset_cache(drflac_bs* bs)
     bs->cache = 0;
     bs->unalignedByteCount = 0;                         /* <-- This clears the trailing unaligned bytes. */
     bs->unalignedCache = 0;
+    bs->isExhausted = DRFLAC_FALSE;
 
 #ifndef DR_FLAC_NO_CRC
     bs->crc16Cache = 0;
     bs->crc16CacheIgnoredBytes = 0;
 #endif
+}
+
+/* The position of the next byte to be read. The bit streamer must be on a byte boundary. */
+static drflac_uint64 drflac__tell_byte(const drflac_bs* bs)
+{
+    DRFLAC_ASSERT((DRFLAC_CACHE_L1_BITS_REMAINING(bs) & 7) == 0);
+    return bs->clientPos - (DRFLAC_CACHE_L2_LINES_REMAINING(bs) * DRFLAC_CACHE_L1_SIZE_BYTES(bs)) - bs->unalignedByteCount - (DRFLAC_CACHE_L1_BITS_REMAINING(bs) / 8);
 }
 
 
@@ -2399,6 +2418,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__read_uint32(drflac_bs* bs, unsigned i
         }
         if (bitCountLo > DRFLAC_CACHE_L1_BITS_REMAINING(bs)) {
             /* This happens when we get to end of stream */
+            bs->isExhausted = DRFLAC_TRUE;
             return DRFLAC_FALSE;
         }
 
@@ -2602,8 +2622,15 @@ static drflac_bool32 drflac__seek_bits(drflac_bs* bs, size_t bitsToSeek)
 }
 
 
-/* This function moves the bit streamer to the first bit after the sync code (bit 15 of the of the frame header). It will also update the CRC-16. */
-static drflac_bool32 drflac__find_and_seek_to_next_sync_code(drflac_bs* bs)
+#define DRFLAC_CACHE_L1_BYTES_01    ((drflac_cache_t)~(drflac_cache_t)0 / 0xFF)
+#define DRFLAC_CACHE_L1_BYTES_80    (DRFLAC_CACHE_L1_BYTES_01 * 0x80)
+#define DRFLAC_CACHE_HAS_FF(x)      ((((~(x)) - DRFLAC_CACHE_L1_BYTES_01) & (x) & DRFLAC_CACHE_L1_BYTES_80) != 0)
+
+/*
+This function moves the bit streamer to the first bit after the sync code (bit 15 of the of the frame header). It will also update the
+CRC-16. It gives up once it has searched past the stream position limit.
+*/
+static drflac_bool32 drflac__find_and_seek_to_next_sync_code(drflac_bs* bs, drflac_uint64 limit)
 {
     DRFLAC_ASSERT(bs != NULL);
 
@@ -2617,6 +2644,27 @@ static drflac_bool32 drflac__find_and_seek_to_next_sync_code(drflac_bs* bs)
 
     for (;;) {
         drflac_uint8 hi;
+
+        /*
+        A sync code starts with a 0xFF byte, so the rest of the L1 cache, and then whole lines of the L2 cache, are passed over while they
+        hold none. Consumed bits are zero, so they can't look like one. The CRC-16 is reset at each candidate, so none is computed here.
+        */
+        while (!DRFLAC_CACHE_HAS_FF(bs->cache)) {
+            if (drflac__tell_byte(bs) >= limit) {
+                return DRFLAC_FALSE;
+            }
+
+            while (bs->nextL2Line < DRFLAC_CACHE_L2_LINE_COUNT(bs) && !DRFLAC_CACHE_HAS_FF(bs->cacheL2[bs->nextL2Line])) {
+                bs->nextL2Line += 1;
+            }
+
+            bs->consumedBits = DRFLAC_CACHE_L1_SIZE_BITS(bs);
+            bs->cache = 0;
+            bs->crc16CacheIgnoredBytes = DRFLAC_CACHE_L1_SIZE_BYTES(bs);
+            if (!drflac__reload_cache(bs)) {
+                return DRFLAC_FALSE;
+            }
+        }
 
 #ifndef DR_FLAC_NO_CRC
         drflac__reset_crc16(bs);
@@ -2889,6 +2937,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__seek_past_next_set_bit(drflac_bs* bs,
 
     if (setBitOffsetPlus1 > DRFLAC_CACHE_L1_BITS_REMAINING(bs)) {
         /* This happens when we get to end of stream */
+        bs->isExhausted = DRFLAC_TRUE;
         return DRFLAC_FALSE;
     }
 
@@ -2938,6 +2987,7 @@ static drflac_bool32 drflac__seek_to_byte(drflac_bs* bs, drflac_uint64 offsetFro
 
     /* The cache should be reset to force a reload of fresh data from the client. */
     drflac__reset_cache(bs);
+    bs->clientPos = offsetFromStart;
     return DRFLAC_TRUE;
 }
 
@@ -3411,6 +3461,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__read_rice_parts(drflac_bs* bs, drflac
             }
             if (bitCountLo > DRFLAC_CACHE_L1_BITS_REMAINING(bs)) {
                 /* This happens when we get to end of stream */
+                bs->isExhausted = DRFLAC_TRUE;
                 return DRFLAC_FALSE;
             }
         }
@@ -3495,6 +3546,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__read_rice_parts_x1(drflac_bs* bs, drf
                 }
                 if (riceParamPartLoBitCount > DRFLAC_CACHE_L1_BITS_REMAINING(bs)) {
                     /* This happens when we get to end of stream */
+                    bs->isExhausted = DRFLAC_TRUE;
                     return DRFLAC_FALSE;
                 }
 
@@ -3609,6 +3661,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__seek_rice_parts(drflac_bs* bs, drflac
 
                 if (riceParamPartLoBitCount > DRFLAC_CACHE_L1_BITS_REMAINING(bs)) {
                     /* This happens when we get to end of stream */
+                    bs->isExhausted = DRFLAC_TRUE;
                     return DRFLAC_FALSE;
                 }
 
@@ -5363,10 +5416,10 @@ static void drflac__decorrelate_frame_with_33_bit_side(drflac* pFlac)
 }
 
 /*
-Reads the next frame header. *pHeaderOut is only written when a header is found: the fields of a candidate that turns out to be a false
-sync code must not end up in the caller's header.
+Reads the next frame header, giving up once it has searched past the stream position limit. *pHeaderOut is only written when a header
+is found: the fields of a candidate that turns out to be a false sync code must not end up in the caller's header.
 */
-static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_frame_header* pHeaderOut)
+static drflac_bool32 drflac__read_next_flac_frame_header_before(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_uint64 limit, drflac_frame_header* pHeaderOut)
 {
     const drflac_uint32 sampleRateTable[12]  = {0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000};
     const drflac_uint8 bitsPerSampleTable[8] = {0, 8, 12, (drflac_uint8)-1, 16, 20, 24, 32};   /* -1 = reserved. */
@@ -5387,7 +5440,7 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
         drflac_uint8 bitsPerSample = 0;
         drflac_bool32 isVariableBlockSize;
 
-        if (!drflac__find_and_seek_to_next_sync_code(bs)) {
+        if (!drflac__find_and_seek_to_next_sync_code(bs, limit)) {
             return DRFLAC_FALSE;
         }
 
@@ -5546,6 +5599,11 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
         *pHeaderOut = candidate;
         return DRFLAC_TRUE;
     }
+}
+
+static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_frame_header* header)
+{
+    return drflac__read_next_flac_frame_header_before(bs, streaminfoBitsPerSample, ~(drflac_uint64)0, header);
 }
 
 static drflac_bool32 drflac__read_subframe_header(drflac_bs* bs, drflac_subframe* pSubframe)
