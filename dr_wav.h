@@ -3894,20 +3894,24 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     pWav->bytesRemaining      = dataChunkSize;
     pWav->dataChunkDataSize   = dataChunkSize;
 
-    if (sampleCountFromFactChunk != 0) {
-        pWav->totalPCMFrameCount = sampleCountFromFactChunk;
-    } else if (aiffFrameCount != 0) {
-        pWav->totalPCMFrameCount = aiffFrameCount;
-    } else {
+    {
+        /*
+        The frames the data chunk holds. A fact or COMM chunk's count is used instead when it's no more than that: it can be fewer, as it
+        is for the last partial block of an ADPCM stream, but not more, as it is for a file cut short, since reads end with the data and
+        seeks are made within it.
+        */
+        drwav_uint64 framesInData;
+        drwav_uint64 declaredFrameCount = (sampleCountFromFactChunk != 0) ? sampleCountFromFactChunk : aiffFrameCount;
+        drwav_bool32 framesInDataKnown = DRWAV_TRUE;
         drwav_uint32 bytesPerFrame = drwav_get_bytes_per_pcm_frame(pWav);
         if (bytesPerFrame == 0) {
             drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
             return DRWAV_FALSE; /* Invalid file. */
         }
 
-        pWav->totalPCMFrameCount = dataChunkSize / bytesPerFrame;
+        framesInData = dataChunkSize / bytesPerFrame;
 
-        if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
+        if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM || pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
             drwav_uint64 totalBlockHeaderSizeInBytes;
             drwav_uint64 blockCount = dataChunkSize / fmt.blockAlign;
 
@@ -3917,34 +3921,26 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             }
 
             /* We decode two samples per byte. There will be blockCount headers in the data chunk. This is enough to know how to calculate the total PCM frame count. */
-            totalBlockHeaderSizeInBytes = blockCount * (6*fmt.channels);
+            totalBlockHeaderSizeInBytes = blockCount * (((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) ? 6 : 4) * fmt.channels);
             if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
-                drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-                return DRWAV_FALSE; /* Invalid file. */
-            }
+                framesInDataKnown = DRWAV_FALSE;
+            } else {
+                framesInData = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
 
-            pWav->totalPCMFrameCount = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
+                /* An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample. */
+                if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
+                    framesInData += blockCount;
+                }
+            }
         }
-        if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
-            drwav_uint64 totalBlockHeaderSizeInBytes;
-            drwav_uint64 blockCount = dataChunkSize / fmt.blockAlign;
 
-            /* Make sure any trailing partial block is accounted for. */
-            if ((blockCount * fmt.blockAlign) < dataChunkSize) {
-                blockCount += 1;
-            }
-
-            /* We decode two samples per byte. There will be blockCount headers in the data chunk. This is enough to know how to calculate the total PCM frame count. */
-            totalBlockHeaderSizeInBytes = blockCount * (4*fmt.channels);
-            if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
-                drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-                return DRWAV_FALSE; /* Invalid file. */
-            }
-
-            pWav->totalPCMFrameCount = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
-
-            /* The header includes a decoded sample for each channel which acts as the initial predictor sample. */
-            pWav->totalPCMFrameCount += blockCount;
+        if (declaredFrameCount != 0 && (!framesInDataKnown || declaredFrameCount <= framesInData)) {
+            pWav->totalPCMFrameCount = declaredFrameCount;
+        } else if (framesInDataKnown) {
+            pWav->totalPCMFrameCount = framesInData;
+        } else {
+            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE; /* Invalid file. */
         }
     }
 
