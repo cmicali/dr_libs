@@ -949,6 +949,13 @@ typedef struct
         drwav_bool32 silentBlock;      /* The current block's header is damaged, so its frames are silence. */
     } msadpcm;
 
+    /*
+    MS ADPCM only. The fmt chunk's coefficient table, which a block's predictor indexes: coeff1 then coeff2 a pair, at most the 256 a
+    predictor can name. Kept apart from msadpcm, which seeking clears.
+    */
+    drwav_int16* pMSADPCMCoefficients;
+    drwav_uint32 msadpcmCoefficientCount;
+
     /* IMA ADPCM specific data. */
     struct
     {
@@ -3186,10 +3193,6 @@ DRWAV_PRIVATE drwav_bool32 drwav__is_chunk_header_at(drwav* pWav, drwav_uint64 p
     return drwav_bytes_to_u32_ex(header + 4, pWav->container) <= fileSize - position - sizeof(header);
 }
 
-/* The coefficient pairs an MS ADPCM block's predictor indexes: the standard seven, the only table the decoder has. */
-static const drwav_int32 drwav__msadpcm_coeff1[] = { 256, 512, 0, 192, 240, 460,  392 };
-static const drwav_int32 drwav__msadpcm_coeff2[] = { 0,  -256, 0, 64,  0,  -208, -232 };
-
 DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc onChunk, void* pChunkUserData, drwav_uint32 flags)
 {
     /* This function assumes drwav_preinit() has been called beforehand. */
@@ -3213,7 +3216,9 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     drwav_uint64 aiffFrameCount = 0;
     drwav_int64 fileSize;
     drwav_bool32 hasKnownFileSize = DRWAV_FALSE;
-    drwav_bool32 msadpcmCoefficientsBuiltIn = DRWAV_TRUE;  /* Whether an MS ADPCM fmt chunk's coefficient table is the decoder's. */
+    /* An MS ADPCM fmt chunk's coefficient table, coeff1 then coeff2 a pair: the standard seven for a fmt chunk without one, none for one cut short. */
+    drwav_int16 msadpcmCoefficients[256*2] = { 256, 0,  512, -256,  0, 0,  192, 64,  240, 0,  460, -208,  392, -232 };
+    drwav_uint32 msadpcmCoefficientCount = 7;
 
     cursor = 0;
     sequential = (flags & DRWAV_SEQUENTIAL) != 0;
@@ -3552,25 +3557,39 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                         drwav_bytes_to_guid(fmtext + 6, fmt.subFormat);
                     } else if (fmt.formatTag == DR_WAVE_FORMAT_ADPCM) {
                         /*
-                        MS ADPCM's extension is the frames a block and then the coefficient table its blocks' predictors index. The
-                        decoder has only the standard table, so a stream with any other is refused below, where a block naming a pair
-                        past the seventh would decode as damage and one of other values as noise.
+                        MS ADPCM's extension is the frames a block, then the coefficient table its blocks' predictors index: a count and
+                        that many pairs. A table cut short, which CoreAudio refuses, or empty, which leaves no block decodable, is
+                        refused below. Pairs past the 256 a predictor can name are skipped.
                         */
-                        drwav_uint8 msadpcmext[4 + 7*4];
-                        drwav_uint32 msadpcmextSize = (fmt.extendedSize < sizeof(msadpcmext)) ? fmt.extendedSize : (drwav_uint32)sizeof(msadpcmext);
+                        drwav_uint8 msadpcmext[4];
+                        drwav_uint32 msadpcmextRead = 0;
                         drwav_uint32 iCoeff;
 
-                        if (pWav->onRead(pWav->pUserData, msadpcmext, msadpcmextSize) != msadpcmextSize) {
-                            return DRWAV_FALSE;
-                        }
-                        if (fmt.extendedSize > msadpcmextSize && pWav->onSeek(pWav->pUserData, fmt.extendedSize - msadpcmextSize, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
-                            return DRWAV_FALSE;
-                        }
+                        msadpcmCoefficientCount = 0;
+                        if (fmt.extendedSize >= sizeof(msadpcmext)) {
+                            drwav_uint32 declaredCount;
 
-                        msadpcmCoefficientsBuiltIn = msadpcmextSize == sizeof(msadpcmext) && drwav_bytes_to_u16_ex(msadpcmext + 2, pWav->container) == 7;
-                        for (iCoeff = 0; msadpcmCoefficientsBuiltIn && iCoeff < 7; iCoeff += 1) {
-                            msadpcmCoefficientsBuiltIn = (drwav_int16)drwav_bytes_to_u16_ex(msadpcmext + 4 + iCoeff*4 + 0, pWav->container) == drwav__msadpcm_coeff1[iCoeff] &&
-                                                         (drwav_int16)drwav_bytes_to_u16_ex(msadpcmext + 4 + iCoeff*4 + 2, pWav->container) == drwav__msadpcm_coeff2[iCoeff];
+                            if (pWav->onRead(pWav->pUserData, msadpcmext, sizeof(msadpcmext)) != sizeof(msadpcmext)) {
+                                return DRWAV_FALSE;
+                            }
+                            msadpcmextRead = sizeof(msadpcmext);
+
+                            declaredCount = drwav_bytes_to_u16_ex(msadpcmext + 2, pWav->container);
+                            if (fmt.extendedSize >= sizeof(msadpcmext) + declaredCount*4) {
+                                msadpcmCoefficientCount = (declaredCount < 256) ? declaredCount : 256;
+                                if (pWav->onRead(pWav->pUserData, msadpcmCoefficients, msadpcmCoefficientCount*4) != msadpcmCoefficientCount*4) {
+                                    return DRWAV_FALSE;
+                                }
+                                msadpcmextRead += msadpcmCoefficientCount*4;
+
+                                /* In place: each value is read from its own two bytes. */
+                                for (iCoeff = 0; iCoeff < msadpcmCoefficientCount*2; iCoeff += 1) {
+                                    msadpcmCoefficients[iCoeff] = (drwav_int16)drwav_bytes_to_u16_ex((drwav_uint8*)msadpcmCoefficients + iCoeff*2, pWav->container);
+                                }
+                            }
+                        }
+                        if (fmt.extendedSize > msadpcmextRead && pWav->onSeek(pWav->pUserData, fmt.extendedSize - msadpcmextRead, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
+                            return DRWAV_FALSE;
                         }
                     } else {
                         if (pWav->onSeek(pWav->pUserData, fmt.extendedSize, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
@@ -4146,12 +4165,12 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     /*
     A WAV ADPCM block must hold its header, and an IMA ADPCM one whole groups of 4 bytes a channel after it: the readers count a block's
     bytes down by header and group, and a count that went below 0 would wrap, and the blocks after it be read out of step. An MS ADPCM
-    stream must use the coefficient table the decoder has.
+    stream needs a coefficient pair for its blocks' predictors to index.
     */
     if (pWav->container != drwav_container_aiff) {
         drwav_uint32 blockAlign = fmt.blockAlign;
         drwav_uint32 channels   = fmt.channels;
-        if ((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM     && (blockAlign <  7 * channels || !msadpcmCoefficientsBuiltIn)) ||
+        if ((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM     && (blockAlign <  7 * channels || msadpcmCoefficientCount == 0)) ||
             (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && (blockAlign <= 4 * channels || (blockAlign - 4 * channels) % (4 * channels) != 0))) {
             drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
             return DRWAV_FALSE;
@@ -4162,6 +4181,18 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     if (drwav_get_bytes_per_pcm_frame(pWav) == 0) {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
         return DRWAV_FALSE;
+    }
+
+    /* Unlike the read-ahead, the coefficient table is needed to decode at all. */
+    if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
+        size_t sizeInBytes = msadpcmCoefficientCount * 2 * sizeof(drwav_int16);
+        pWav->pMSADPCMCoefficients = (drwav_int16*)drwav__malloc_from_callbacks(sizeInBytes, &pWav->allocationCallbacks);
+        if (pWav->pMSADPCMCoefficients == NULL) {
+            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE;
+        }
+        DRWAV_COPY_MEMORY(pWav->pMSADPCMCoefficients, msadpcmCoefficients, sizeInBytes);
+        pWav->msadpcmCoefficientCount = msadpcmCoefficientCount;
     }
 
     /* Without room for its read-ahead an ADPCM stream is read a few bytes at a time, as it used to be. */
@@ -6112,6 +6143,7 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
         drwav_free(pWav->pIMA4Checkpoints, &pWav->allocationCallbacks);
         drwav_free(pWav->pADPCMBuffer, &pWav->allocationCallbacks);
+        drwav_free(pWav->pMSADPCMCoefficients, &pWav->allocationCallbacks);
     }
 
 #ifndef DR_WAV_NO_STDIO
@@ -6738,10 +6770,10 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 pWav->msadpcm.cachedFrameCount = 2;
 
                 /*
-                The predictor is used as an index into drwav__msadpcm_coeff1 so we'll need to validate to ensure it never overflows. A block whose
+                The predictor is used as an index into the coefficient table so we'll need to validate to ensure it never overflows. A block whose
                 predictor is out of range is damaged: it keeps its frames in the timeline, as silence, and the blocks after it play.
                 */
-                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff2));
+                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= pWav->msadpcmCoefficientCount);
                 if (pWav->msadpcm.silentBlock) {
                     pWav->msadpcm.predictor[0] = 0;
                 }
@@ -6769,8 +6801,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 pWav->msadpcm.cachedFrameCount = 2;
 
                 /* As for mono. */
-                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff2) ||
-                                             pWav->msadpcm.predictor[1] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[1] >= drwav_countof(drwav__msadpcm_coeff2));
+                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= pWav->msadpcmCoefficientCount || pWav->msadpcm.predictor[1] >= pWav->msadpcmCoefficientCount);
                 if (pWav->msadpcm.silentBlock) {
                     pWav->msadpcm.predictor[0] = 0;
                     pWav->msadpcm.predictor[1] = 0;
@@ -6827,11 +6858,11 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                     drwav_int32 newSample1;
 
                     /* The predictor is read from the file and then indexed into a table. Check that it's in bounds. */
-                    if (pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff2)) {
+                    if (pWav->msadpcm.predictor[0] >= pWav->msadpcmCoefficientCount) {
                         return totalFramesRead;
                     }
 
-                    newSample0  = ((pWav->msadpcm.prevFrames[0][1] * drwav__msadpcm_coeff1[pWav->msadpcm.predictor[0]]) + (pWav->msadpcm.prevFrames[0][0] * drwav__msadpcm_coeff2[pWav->msadpcm.predictor[0]])) >> 8;
+                    newSample0  = (drwav_int32)(((drwav_int64)pWav->msadpcm.prevFrames[0][1] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 0] + (drwav_int64)pWav->msadpcm.prevFrames[0][0] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 1]) >> 8);   /* 64-bit: a table's pairs can sum past an int32. */
                     newSample0  = (drwav_int32)drwav_clamp((drwav_int64)newSample0 + (drwav_int64)nibble0 * pWav->msadpcm.delta[0], -32768, 32767);   /* 64-bit: delta can grow past what an int32 product holds. */
 
                     pWav->msadpcm.delta[0] = (drwav_int32)drwav_clamp(((drwav_int64)adaptationTable[((nibbles & 0xF0) >> 4)] * pWav->msadpcm.delta[0]) >> 8, 16, 0x7FFFFFFF);
@@ -6840,7 +6871,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                     pWav->msadpcm.prevFrames[0][1] = newSample0;
 
 
-                    newSample1  = ((pWav->msadpcm.prevFrames[0][1] * drwav__msadpcm_coeff1[pWav->msadpcm.predictor[0]]) + (pWav->msadpcm.prevFrames[0][0] * drwav__msadpcm_coeff2[pWav->msadpcm.predictor[0]])) >> 8;
+                    newSample1  = (drwav_int32)(((drwav_int64)pWav->msadpcm.prevFrames[0][1] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 0] + (drwav_int64)pWav->msadpcm.prevFrames[0][0] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 1]) >> 8);   /* 64-bit: a table's pairs can sum past an int32. */
                     newSample1  = (drwav_int32)drwav_clamp((drwav_int64)newSample1 + (drwav_int64)nibble1 * pWav->msadpcm.delta[0], -32768, 32767);   /* 64-bit: delta can grow past what an int32 product holds. */
 
                     pWav->msadpcm.delta[0] = (drwav_int32)drwav_clamp(((drwav_int64)adaptationTable[((nibbles & 0x0F) >> 0)] * pWav->msadpcm.delta[0]) >> 8, 16, 0x7FFFFFFF);
@@ -6857,11 +6888,11 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                     drwav_int32 newSample1;
 
                     /* Left. */
-                    if (pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[0] >= drwav_countof(drwav__msadpcm_coeff2)) {
+                    if (pWav->msadpcm.predictor[0] >= pWav->msadpcmCoefficientCount) {
                         return totalFramesRead; /* Out of bounds. Invalid file. */
                     }
 
-                    newSample0  = ((pWav->msadpcm.prevFrames[0][1] * drwav__msadpcm_coeff1[pWav->msadpcm.predictor[0]]) + (pWav->msadpcm.prevFrames[0][0] * drwav__msadpcm_coeff2[pWav->msadpcm.predictor[0]])) >> 8;
+                    newSample0  = (drwav_int32)(((drwav_int64)pWav->msadpcm.prevFrames[0][1] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 0] + (drwav_int64)pWav->msadpcm.prevFrames[0][0] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[0]*2 + 1]) >> 8);   /* 64-bit: a table's pairs can sum past an int32. */
                     newSample0  = (drwav_int32)drwav_clamp((drwav_int64)newSample0 + (drwav_int64)nibble0 * pWav->msadpcm.delta[0], -32768, 32767);   /* 64-bit: delta can grow past what an int32 product holds. */
 
                     pWav->msadpcm.delta[0] = (drwav_int32)drwav_clamp(((drwav_int64)adaptationTable[((nibbles & 0xF0) >> 4)] * pWav->msadpcm.delta[0]) >> 8, 16, 0x7FFFFFFF);
@@ -6871,11 +6902,11 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
 
 
                     /* Right. */
-                    if (pWav->msadpcm.predictor[1] >= drwav_countof(drwav__msadpcm_coeff1) || pWav->msadpcm.predictor[1] >= drwav_countof(drwav__msadpcm_coeff2)) {
+                    if (pWav->msadpcm.predictor[1] >= pWav->msadpcmCoefficientCount) {
                         return totalFramesRead; /* Out of bounds. Invalid file. */
                     }
 
-                    newSample1  = ((pWav->msadpcm.prevFrames[1][1] * drwav__msadpcm_coeff1[pWav->msadpcm.predictor[1]]) + (pWav->msadpcm.prevFrames[1][0] * drwav__msadpcm_coeff2[pWav->msadpcm.predictor[1]])) >> 8;
+                    newSample1  = (drwav_int32)(((drwav_int64)pWav->msadpcm.prevFrames[1][1] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[1]*2 + 0] + (drwav_int64)pWav->msadpcm.prevFrames[1][0] * pWav->pMSADPCMCoefficients[pWav->msadpcm.predictor[1]*2 + 1]) >> 8);   /* 64-bit: a table's pairs can sum past an int32. */
                     newSample1  = (drwav_int32)drwav_clamp((drwav_int64)newSample1 + (drwav_int64)nibble1 * pWav->msadpcm.delta[1], -32768, 32767);   /* 64-bit: delta can grow past what an int32 product holds. */
 
                     pWav->msadpcm.delta[1] = (drwav_int32)drwav_clamp(((drwav_int64)adaptationTable[((nibbles & 0x0F) >> 0)] * pWav->msadpcm.delta[1]) >> 8, 16, 0x7FFFFFFF);
