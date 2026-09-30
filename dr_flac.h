@@ -4961,8 +4961,8 @@ static drflac_bool32 drflac__read_and_seek_residual(drflac_bs* bs, drflac_uint32
         return DRFLAC_FALSE;
     }
 
-    /* Validation check. */
-    if ((blockSize / (1 << partitionOrder)) <= order) {
+    /* Validation check. This must match drflac__decode_samples_with_residual(): the first partition can legally hold no residuals. */
+    if ((blockSize / (1 << partitionOrder)) < order) {
         return DRFLAC_FALSE;
     }
 
