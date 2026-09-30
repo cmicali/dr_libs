@@ -6180,13 +6180,14 @@ DRWAV_API drwav_bool32 drwav_seek_to_pcm_frame(drwav* pWav, drwav_uint64 targetF
             return DRWAV_FALSE; /* Not able to calculate offset. */
         }
 
-        totalSizeInBytes = pWav->totalPCMFrameCount * bytesPerFrame;
-        /*DRWAV_ASSERT(totalSizeInBytes >= pWav->bytesRemaining);*/
-
-        currentBytePos = totalSizeInBytes - pWav->bytesRemaining;
+        /*
+        The position comes from the read cursor, not from the frame count less the bytes remaining: the two are counted from different
+        ends, and the count need not be the frames the data holds.
+        */
+        currentBytePos = pWav->readCursorInPCMFrames * bytesPerFrame;
         targetBytePos  = targetFrameIndex * bytesPerFrame;
 
-        if (currentBytePos < targetBytePos) {
+        if (currentBytePos <= targetBytePos) {
             /* Offset forwards. */
             offset = (targetBytePos - currentBytePos);
         } else {
@@ -6198,15 +6199,18 @@ DRWAV_API drwav_bool32 drwav_seek_to_pcm_frame(drwav* pWav, drwav_uint64 targetF
         }
 
         while (offset > 0) {
-            int offset32 = ((offset > INT_MAX) ? INT_MAX : (int)offset);
+            /* Whole frames at a time, or a seek of more than INT_MAX bytes leaves the cursor part way into a frame. */
+            int offset32 = ((offset > INT_MAX) ? (int)((INT_MAX / bytesPerFrame) * bytesPerFrame) : (int)offset);
             if (!pWav->onSeek(pWav->pUserData, offset32, DRWAV_SEEK_CUR)) {
                 return DRWAV_FALSE;
             }
 
             pWav->readCursorInPCMFrames += offset32 / bytesPerFrame;
-            pWav->bytesRemaining        -= offset32;
             offset                      -= offset32;
         }
+
+        totalSizeInBytes = pWav->readCursorInPCMFrames * bytesPerFrame;
+        pWav->bytesRemaining = (totalSizeInBytes < pWav->dataChunkDataSize) ? (pWav->dataChunkDataSize - totalSizeInBytes) : 0;
     }
 
     return DRWAV_TRUE;
