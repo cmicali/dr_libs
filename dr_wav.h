@@ -3613,8 +3613,15 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             if (isAIFCFormType) {
                 const drwav_uint8* type = commData + 18;
 
-                if (drwav_fourcc_equal(type, "NONE")) {
-                    compressionFormat = DR_WAVE_FORMAT_PCM; /* PCM, big-endian. */
+                if (drwav_fourcc_equal(type, "NONE") || drwav_fourcc_equal(type, "twos")) {
+                    compressionFormat = DR_WAVE_FORMAT_PCM; /* PCM, big-endian. Apple's tools write 16-bit AIFF-C as "twos". */
+                } else if (drwav_fourcc_equal(type, "in24") || drwav_fourcc_equal(type, "in32")) {
+                    compressionFormat = DR_WAVE_FORMAT_PCM; /* PCM, big-endian, of the width the type names. */
+                    sampleSizeInBits  = (type[2] == '2') ? 24 : 32;
+                } else if (drwav_fourcc_equal(type, "42ni") || drwav_fourcc_equal(type, "23ni")) {
+                    compressionFormat = DR_WAVE_FORMAT_PCM; /* PCM, little-endian: "in24" and "in32" reversed. */
+                    sampleSizeInBits  = (type[0] == '4') ? 24 : 32;
+                    pWav->aiff.isLE = DRWAV_TRUE;
                 } else if (drwav_fourcc_equal(type, "raw ")) {
                     compressionFormat = DR_WAVE_FORMAT_PCM;
 
@@ -3627,6 +3634,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     pWav->aiff.isLE = DRWAV_TRUE;
                 } else if (drwav_fourcc_equal(type, "fl32") || drwav_fourcc_equal(type, "fl64") || drwav_fourcc_equal(type, "FL32") || drwav_fourcc_equal(type, "FL64")) {
                     compressionFormat = DR_WAVE_FORMAT_IEEE_FLOAT;
+                    sampleSizeInBits  = (type[2] == '3') ? 32 : 64;    /* The type names the width, whatever the sample size says. */
                 } else if (drwav_fourcc_equal(type, "alaw") || drwav_fourcc_equal(type, "ALAW")) {
                     compressionFormat = DR_WAVE_FORMAT_ALAW;
                 } else if (drwav_fourcc_equal(type, "ulaw") || drwav_fourcc_equal(type, "ULAW")) {
