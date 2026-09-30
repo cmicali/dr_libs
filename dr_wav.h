@@ -289,6 +289,9 @@ typedef drwav_int32 drwav_result;
 
 /* Flags to pass into drwav_init_ex(), etc. */
 #define DRWAV_SEQUENTIAL            0x00000001
+
+/* AIFF-C ima4 packets between the decoder states kept for seeking: 4096 frames. */
+#define DRWAV_IMA4_PACKETS_PER_CHECKPOINT   64
 #define DRWAV_WITH_METADATA         0x00000002
 
 DRWAV_API void drwav_version(drwav_uint32* pMajor, drwav_uint32* pMinor, drwav_uint32* pRevision);
@@ -951,9 +954,19 @@ typedef struct
         drwav_uint32 bytesRemainingInBlock;
         drwav_int32  predictor[2];
         drwav_int32  stepIndex[2];
-        drwav_int32  cachedFrames[16]; /* Samples are stored in this cache during decoding. */
+        drwav_int32  cachedFrames[128]; /* Samples are stored in this cache during decoding. An AIFF-C ima4 packet decodes to 64 frames. */
         drwav_uint32 cachedFrameCount;
+        drwav_uint64 packetIndex;       /* AIFF-C ima4 only. The next packet to decode. */
     } ima;
+
+    /*
+    AIFF-C ima4 only. An ima4 packet's decode depends on the decoder's state at its start, which only decoding every packet before it
+    gives, so the state is recorded every DRWAV_IMA4_PACKETS_PER_CHECKPOINT packets as they are decoded, for seeks to start from.
+    Each checkpoint is a predictor and step index a channel. Kept apart from ima, which seeking back to the start clears.
+    */
+    drwav_int32* pIMA4Checkpoints;
+    drwav_uint64 ima4CheckpointCount;
+    drwav_uint64 ima4CheckpointCapacity;
 
     /* AIFF specific data. */
     struct
@@ -3640,17 +3653,12 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 } else if (drwav_fourcc_equal(type, "ulaw") || drwav_fourcc_equal(type, "ULAW")) {
                     compressionFormat = DR_WAVE_FORMAT_MULAW;
                 } else if (drwav_fourcc_equal(type, "ima4")) {
+                    /*
+                    Apple's IMA ADPCM: packets of 34 bytes a channel, one channel after another, each a 2-byte header and 64 samples
+                    in 4-bit codes. COMM counts packets, not frames.
+                    */
                     compressionFormat = DR_WAVE_FORMAT_DVI_ADPCM;
                     sampleSizeInBits  = 4;
-
-                    /*
-                    I haven't been able to figure out how to get correct decoding for IMA ADPCM. Until this is figured out
-                    we'll need to abort when we encounter such an encoding. Advice welcome!
-                    */
-                    (void)compressionFormat;
-                    (void)sampleSizeInBits;
-
-                    return DRWAV_FALSE;
                 } else {
                     return DRWAV_FALSE; /* Unknown or unsupported compression format. Need to abort. */
                 }
@@ -3659,7 +3667,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             }
 
             /* With AIFF we want to use the explicitly defined frame count rather than deriving it from the size of the chunk. */
-            aiffFrameCount = frameCount;
+            aiffFrameCount = (compressionFormat == DR_WAVE_FORMAT_DVI_ADPCM) ? (drwav_uint64)frameCount * 64 : frameCount;
 
             /* We should now have enough information to fill out our fmt structure. */
             fmt.formatTag      = compressionFormat;
@@ -3668,6 +3676,12 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             fmt.bitsPerSample  = (sampleSizeInBits + 7) & ~7;   /* In AIFF, samples are padded to 8-bit boundaries. We need to round up our bits per sample here. */
             fmt.blockAlign     = (drwav_uint16)((drwav_uint32)fmt.channels * fmt.bitsPerSample / 8);
             fmt.avgBytesPerSec = fmt.blockAlign * fmt.sampleRate;
+
+            if (compressionFormat == DR_WAVE_FORMAT_DVI_ADPCM) {
+                fmt.bitsPerSample  = 4;
+                fmt.blockAlign     = (drwav_uint16)(34 * (drwav_uint32)fmt.channels);   /* A block is a packet of every channel. */
+                fmt.avgBytesPerSec = (drwav_uint32)(((drwav_uint64)fmt.blockAlign * fmt.sampleRate) / 64);
+            }
 
             /*
             Weird one. I've seen some alaw and ulaw encoded files that for some reason set the bits per sample to 16 when
@@ -3961,7 +3975,9 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
         framesInData = dataChunkSize / bytesPerFrame;
 
-        if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM || pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
+        if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && pWav->container == drwav_container_aiff) {
+            framesInData = (dataChunkSize / fmt.blockAlign) * 64;   /* Only whole ima4 packets decode. */
+        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM || pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
             drwav_uint64 totalBlockHeaderSizeInBytes;
             drwav_uint64 blockCount = dataChunkSize / fmt.blockAlign;
 
@@ -4017,6 +4033,18 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     if (drwav_get_bytes_per_pcm_frame(pWav) == 0) {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
         return DRWAV_FALSE;
+    }
+
+    /* Without room for its checkpoints an ima4 stream still plays, and seeks by decoding from its start. */
+    if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && pWav->container == drwav_container_aiff) {
+        drwav_uint64 capacity = (dataChunkSize / fmt.blockAlign) / DRWAV_IMA4_PACKETS_PER_CHECKPOINT + 1;
+        drwav_uint64 sizeInBytes = capacity * 2 * pWav->channels * sizeof(drwav_int32);
+        if (sizeInBytes <= DRWAV_SIZE_MAX) {
+            pWav->pIMA4Checkpoints = (drwav_int32*)drwav__malloc_from_callbacks((size_t)sizeInBytes, &pWav->allocationCallbacks);
+            if (pWav->pIMA4Checkpoints != NULL) {
+                pWav->ima4CheckpointCapacity = capacity;
+            }
+        }
     }
 
 #ifdef DR_WAV_LIBSNDFILE_COMPAT
@@ -5944,6 +5972,7 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
         }
     } else {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+        drwav_free(pWav->pIMA4Checkpoints, &pWav->allocationCallbacks);
     }
 
 #ifndef DR_WAV_NO_STDIO
@@ -6187,17 +6216,57 @@ DRWAV_API drwav_bool32 drwav_seek_to_pcm_frame(drwav* pWav, drwav_uint64 targetF
     }
 
     /*
-    For compressed formats we just use a slow generic seek. If we are seeking forward we just seek forward. If we are going backwards we need
-    to seek back to the start.
+    For compressed formats a decode can start only where a block starts, so the seek goes to the last such position at or before the target,
+    unless the read cursor is between the two, and decodes forward from there. ADPCM blocks in a WAV file are independent of one another. An
+    AIFF-C ima4 packet isn't, so there the positions are the checkpoints decoding has recorded.
     */
     if (drwav__is_compressed_format_tag(pWav->translatedFormatTag)) {
-        /* TODO: This can be optimized. */
+        drwav_uint64 framesPerJump = 0;
+        drwav_uint64 bytesPerJump  = pWav->fmt.blockAlign;
+        drwav_uint32 channels      = pWav->channels;
 
-        /*
-        If we're seeking forward it's simple - just keep reading samples until we hit the sample we're requesting. If we're seeking backwards,
-        we first need to seek back to the start and then just do the same thing as a forward seek.
-        */
-        if (targetFrameIndex < pWav->readCursorInPCMFrames) {
+        if (pWav->container == drwav_container_aiff) {
+            framesPerJump = 64 * DRWAV_IMA4_PACKETS_PER_CHECKPOINT;
+            bytesPerJump  = (drwav_uint64)pWav->fmt.blockAlign * DRWAV_IMA4_PACKETS_PER_CHECKPOINT;
+        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM && pWav->fmt.blockAlign >= 7 * channels) {
+            framesPerJump = ((pWav->fmt.blockAlign - 7 * channels) * 2) / channels + 2;
+        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && pWav->fmt.blockAlign >= 4 * channels) {
+            framesPerJump = ((pWav->fmt.blockAlign - 4 * channels) * 2) / channels + 1;
+        }
+
+        if (framesPerJump > 0) {
+            drwav_uint64 jumpIndex = targetFrameIndex / framesPerJump;
+            if (pWav->container == drwav_container_aiff && jumpIndex >= pWav->ima4CheckpointCount) {
+                jumpIndex = (pWav->ima4CheckpointCount > 0) ? pWav->ima4CheckpointCount - 1 : 0;
+            }
+
+            if (targetFrameIndex < pWav->readCursorInPCMFrames || jumpIndex * framesPerJump > pWav->readCursorInPCMFrames) {
+                if (pWav->container == drwav_container_aiff && pWav->ima4CheckpointCount == 0) {
+                    if (!drwav_seek_to_first_pcm_frame(pWav)) {
+                        return DRWAV_FALSE;
+                    }
+                } else {
+                    if (!drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos + jumpIndex * bytesPerJump, pWav->pUserData)) {
+                        return DRWAV_FALSE;
+                    }
+
+                    DRWAV_ZERO_OBJECT(&pWav->msadpcm);
+                    DRWAV_ZERO_OBJECT(&pWav->ima);
+
+                    if (pWav->container == drwav_container_aiff) {
+                        const drwav_int32* pCheckpoint = pWav->pIMA4Checkpoints + jumpIndex * 2 * channels;
+                        drwav_uint32 iChannel;
+                        for (iChannel = 0; iChannel < channels; iChannel += 1) {
+                            pWav->ima.predictor[iChannel] = pCheckpoint[iChannel*2 + 0];
+                            pWav->ima.stepIndex[iChannel] = pCheckpoint[iChannel*2 + 1];
+                        }
+                        pWav->ima.packetIndex = jumpIndex * DRWAV_IMA4_PACKETS_PER_CHECKPOINT;
+                    }
+
+                    pWav->readCursorInPCMFrames = jumpIndex * framesPerJump;
+                }
+            }
+        } else if (targetFrameIndex < pWav->readCursorInPCMFrames) {
             if (!drwav_seek_to_first_pcm_frame(pWav)) {
                 return DRWAV_FALSE;
             }
@@ -6673,7 +6742,60 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
 
         /* If there are no cached samples we need to load a new block. */
         if (pWav->ima.cachedFrameCount == 0 && pWav->ima.bytesRemainingInBlock == 0) {
-            if (pWav->channels == 1) {
+            if (pWav->container == drwav_container_aiff) {
+                /* AIFF-C ima4. A packet of every channel, each decoded whole into the cache. */
+                drwav_uint8 packet[68];
+                drwav_uint32 packetSize = 34 * pWav->channels;
+                if (pWav->onRead(pWav->pUserData, packet, packetSize) != packetSize) {
+                    return totalFramesRead;
+                }
+
+                /* The state before each checkpoint's packet, recorded the first time decoding reaches it. */
+                if ((pWav->ima.packetIndex % DRWAV_IMA4_PACKETS_PER_CHECKPOINT) == 0 && pWav->ima.packetIndex / DRWAV_IMA4_PACKETS_PER_CHECKPOINT == pWav->ima4CheckpointCount && pWav->ima4CheckpointCount < pWav->ima4CheckpointCapacity) {
+                    drwav_int32* pCheckpoint = pWav->pIMA4Checkpoints + pWav->ima4CheckpointCount * 2 * pWav->channels;
+                    for (iChannel = 0; iChannel < pWav->channels; iChannel += 1) {
+                        pCheckpoint[iChannel*2 + 0] = pWav->ima.predictor[iChannel];
+                        pCheckpoint[iChannel*2 + 1] = pWav->ima.stepIndex[iChannel];
+                    }
+                    pWav->ima4CheckpointCount += 1;
+                }
+                pWav->ima.packetIndex += 1;
+
+                for (iChannel = 0; iChannel < pWav->channels; iChannel += 1) {
+                    const drwav_uint8* pPacket = packet + iChannel*34;
+                    drwav_int32 header = (drwav_int16)((pPacket[0] << 8) | pPacket[1]);
+                    drwav_int32 headerPredictor = header - (header & 0x7F);
+                    drwav_int32 headerStepIndex = drwav_clamp(header & 0x7F, 0, (drwav_int32)drwav_countof(stepTable)-1);
+                    drwav_int32 distance = pWav->ima.predictor[iChannel] - headerPredictor;
+                    drwav_uint32 iSample;
+
+                    /*
+                    The header holds the encoder's state to 9 bits. A decoder in step with the encoder keeps its own, exact state, and the
+                    header takes over only when the two are further apart than that precision allows, at the start or after damage. This
+                    is what CoreAudio does: decoding each packet from its header alone differs from it in nearly every sample.
+                    */
+                    if (pWav->ima.stepIndex[iChannel] != headerStepIndex || distance > 0x7F || distance < -0x7F) {
+                        pWav->ima.predictor[iChannel] = headerPredictor;
+                        pWav->ima.stepIndex[iChannel] = headerStepIndex;
+                    }
+
+                    for (iSample = 0; iSample < 64; iSample += 1) {
+                        drwav_uint8 nibble = (drwav_uint8)((pPacket[2 + iSample/2] >> ((iSample & 1) * 4)) & 0x0F);
+                        drwav_int32 step = stepTable[pWav->ima.stepIndex[iChannel]];
+                        drwav_int32 diff = step >> 3;
+                        if (nibble & 1) diff += step >> 2;
+                        if (nibble & 2) diff += step >> 1;
+                        if (nibble & 4) diff += step;
+                        if (nibble & 8) diff  = -diff;
+
+                        pWav->ima.predictor[iChannel] = drwav_clamp(pWav->ima.predictor[iChannel] + diff, -32768, 32767);
+                        pWav->ima.stepIndex[iChannel] = drwav_clamp(pWav->ima.stepIndex[iChannel] + indexTable[nibble], 0, (drwav_int32)drwav_countof(stepTable)-1);
+                        pWav->ima.cachedFrames[(drwav_countof(pWav->ima.cachedFrames) - 64*pWav->channels) + iSample*pWav->channels + iChannel] = pWav->ima.predictor[iChannel];
+                    }
+                }
+
+                pWav->ima.cachedFrameCount = 64;
+            } else if (pWav->channels == 1) {
                 /* Mono. */
                 drwav_uint8 header[4];
                 if (pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
