@@ -6087,7 +6087,16 @@ static drflac_bool32 drflac__seek_to_pcm_frame__binary_search_internal(drflac* p
     }
 
     pFlac->currentPCMFrame = firstPCMFrame;
-    return drflac__seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - firstPCMFrame) == pcmFrameIndex - firstPCMFrame;
+    if (drflac__seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - firstPCMFrame) != pcmFrameIndex - firstPCMFrame) {
+        /*
+        The stream ends before the target, so it's shorter than STREAMINFO says, as a truncated file is. Land at its end, where reads return
+        nothing, as a seek to the end of a whole stream does, rather than fail and put the decoder back where it was.
+        */
+        DRFLAC_ZERO_MEMORY(&pFlac->currentFLACFrame, sizeof(pFlac->currentFLACFrame));
+        pFlac->currentPCMFrame = pcmFrameIndex;
+    }
+
+    return DRFLAC_TRUE;
 }
 
 static drflac_bool32 drflac__seek_to_pcm_frame__binary_search(drflac* pFlac, drflac_uint64 pcmFrameIndex)
