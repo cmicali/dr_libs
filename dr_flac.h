@@ -5674,6 +5674,17 @@ static drflac_bool32 drflac__decode_subframe(drflac_bs* bs, drflac_frame* frame,
         default: decodeResult = DRFLAC_FALSE;
     }
 
+    /*
+    A left-side or right-side stream's side channel whose wasted bits leave it one bit holds 0 or -2^bitsPerSample, which the read functions
+    scale by 2^(32 - bitsPerSample) to 0 modulo 2^32, the arithmetic they do, but with a shift by 32, which C leaves undefined. Samples of 0
+    get there without one. Mid-side doesn't scale the side channel so far.
+    */
+    if (decodeResult && pSubframe->wastedBitsPerSample >= frame->header.bitsPerSample &&
+        ((frame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_LEFT_SIDE && subframeIndex == 1) || (frame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_RIGHT_SIDE && subframeIndex == 0))) {
+        DRFLAC_ZERO_MEMORY(pSubframe->pSamplesS32, frame->header.blockSizeInPCMFrames * sizeof(drflac_int32));
+        pSubframe->wastedBitsPerSample = 0;
+    }
+
     return decodeResult;
 }
 
