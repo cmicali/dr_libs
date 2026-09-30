@@ -1648,6 +1648,7 @@ typedef drflac_int32 drflac_result;
 
 #define DRFLAC_SEEKPOINT_SIZE_IN_BYTES                  18
 #define DRFLAC_CUESHEET_TRACK_SIZE_IN_BYTES             36
+#define DRFLAC_CUESHEET_TRACK_PADDING_IN_BYTES          4       /* After each track in the parsed track data, so the index points that follow are aligned for their 64-bit offsets. */
 #define DRFLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES       12
 
 #define drflac_align(x, a)                              ((((x) + (a) - 1) / (a)) * (a))
@@ -1864,7 +1865,7 @@ static DRFLAC_INLINE drflac_uint32 drflac__be2host_32(drflac_uint32 n)
 static DRFLAC_INLINE drflac_uint32 drflac__be2host_32_ptr_unaligned(const void* pData)
 {
     const drflac_uint8* pNum = (drflac_uint8*)pData;
-    return *(pNum) << 24 | *(pNum+1) << 16 | *(pNum+2) << 8 | *(pNum+3);
+    return (drflac_uint32)*(pNum) << 24 | (drflac_uint32)*(pNum+1) << 16 | (drflac_uint32)*(pNum+2) << 8 | *(pNum+3);    /* Unsigned, as a byte of 0x80 or more shifted into a promoted int's sign bit is undefined. */
 }
 
 static DRFLAC_INLINE drflac_uint64 drflac__be2host_64(drflac_uint64 n)
@@ -1889,7 +1890,7 @@ static DRFLAC_INLINE drflac_uint32 drflac__le2host_32(drflac_uint32 n)
 static DRFLAC_INLINE drflac_uint32 drflac__le2host_32_ptr_unaligned(const void* pData)
 {
     const drflac_uint8* pNum = (drflac_uint8*)pData;
-    return *pNum | *(pNum+1) << 8 |  *(pNum+2) << 16 | *(pNum+3) << 24;
+    return *pNum | (drflac_uint32)*(pNum+1) << 8 | (drflac_uint32)*(pNum+2) << 16 | (drflac_uint32)*(pNum+3) << 24;  /* Unsigned, as a byte of 0x80 or more shifted into a promoted int's sign bit is undefined. */
 }
 
 
@@ -6970,7 +6971,7 @@ static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                     {
                         const char* pRunningDataSaved = pRunningData;   /* Will be restored at the end in preparation for the second pass. */
 
-                        bufferSize = metadata.data.cuesheet.trackCount * DRFLAC_CUESHEET_TRACK_SIZE_IN_BYTES;
+                        bufferSize = metadata.data.cuesheet.trackCount * (DRFLAC_CUESHEET_TRACK_SIZE_IN_BYTES + DRFLAC_CUESHEET_TRACK_PADDING_IN_BYTES);
 
                         for (iTrack = 0; iTrack < metadata.data.cuesheet.trackCount; ++iTrack) {
                             drflac_uint8 indexCount;
@@ -7025,6 +7026,9 @@ static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                             indexCount = pRunningData[0];
                             pRunningData      += 1;
                             pRunningTrackData += 1;
+
+                            DRFLAC_ZERO_MEMORY(pRunningTrackData, DRFLAC_CUESHEET_TRACK_PADDING_IN_BYTES);
+                            pRunningTrackData += DRFLAC_CUESHEET_TRACK_PADDING_IN_BYTES;
 
                             /* Extract each track index. */
                             for (iIndex = 0; iIndex < indexCount; ++iIndex) {
@@ -12539,7 +12543,7 @@ DRFLAC_API drflac_bool32 drflac_next_cuesheet_track(drflac_cuesheet_track_iterat
     DRFLAC_COPY_MEMORY(cuesheetTrack.ISRC, pRunningData, sizeof(cuesheetTrack.ISRC));     pRunningData += 12;
     cuesheetTrack.isAudio      = (pRunningData[0] & 0x80) != 0;
     cuesheetTrack.preEmphasis  = (pRunningData[0] & 0x40) != 0;                           pRunningData += 14;
-    cuesheetTrack.indexCount   = pRunningData[0];                                         pRunningData += 1;
+    cuesheetTrack.indexCount   = pRunningData[0];                                         pRunningData += 1 + DRFLAC_CUESHEET_TRACK_PADDING_IN_BYTES;
     cuesheetTrack.pIndexPoints = (const drflac_cuesheet_track_index*)pRunningData;        pRunningData += cuesheetTrack.indexCount * sizeof(drflac_cuesheet_track_index);
 
     pIter->pRunningData = pRunningData;
