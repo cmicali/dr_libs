@@ -1104,7 +1104,7 @@ static int drmp3_L3_read_side_info(drmp3_bs *bs, drmp3_L3_gr_info *gr, const drm
     {
         gr_count *= 2;
         main_data_begin = drmp3_bs_get_bits(bs, 9);
-        scfsi = drmp3_bs_get_bits(bs, 7 + gr_count);
+        scfsi = drmp3_bs_get_bits(bs, 7 + gr_count) & ((1u << (2*gr_count)) - 1);   /* Drop the private bits in front of scfsi. */
     } else
     {
         main_data_begin = drmp3_bs_get_bits(bs, 8 + gr_count) >> gr_count;
