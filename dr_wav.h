@@ -3585,13 +3585,13 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             foundChunk_fmt = DRWAV_TRUE;
 
             if (isAIFCFormType) {
-                commDataBytesToRead = 24;
+                commDataBytesToRead = 22;   /* Up to the compression type. The name after it is skipped below. */
                 if (header.sizeInBytes < commDataBytesToRead) {
                     return DRWAV_FALSE; /* Invalid COMM chunk. */
                 }
             } else {
                 commDataBytesToRead = 18;
-                if (header.sizeInBytes != commDataBytesToRead) {
+                if (header.sizeInBytes < commDataBytesToRead) {
                     return DRWAV_FALSE; /* INVALID COMM chunk. */
                 }
             }
@@ -3672,13 +3672,15 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 }
             }
 
-            /* If the form type is AIFC there will be some additional data in the chunk. We need to seek past it. */
-            if (isAIFCFormType) {
-                if (drwav__seek_forward(pWav->onSeek, (chunkSize - commDataBytesToRead), pWav->pUserData) == DRWAV_FALSE) {
-                    return DRWAV_FALSE;
-                }
-                cursor += (chunkSize - commDataBytesToRead);
+            /*
+            If the form type is AIFC there will be some additional data in the chunk, the compression name, and a writer may leave some
+            after an AIFF's 18 bytes too. We need to seek past it, and past the padding byte of a chunk of odd size, which the name's
+            length can give it.
+            */
+            if (drwav__seek_forward(pWav->onSeek, (chunkSize - commDataBytesToRead) + header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
+                return DRWAV_FALSE;
             }
+            cursor += (chunkSize - commDataBytesToRead) + header.paddingSize;
 
             /* Don't fall through or else we'll end up treating this chunk as metadata which is incorrect. */
             continue;
