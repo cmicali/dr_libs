@@ -12084,8 +12084,8 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
         drflac_bool32 wasSuccessful = DRFLAC_FALSE;
         drflac_uint64 originalPCMFrame = pFlac->currentPCMFrame;
 
-        /* Clamp the sample to the end. */
-        if (pcmFrameIndex > pFlac->totalPCMFrameCount) {
+        /* Clamp the sample to the end, when the stream says where that is. A total of 0 means the length is unknown. */
+        if (pFlac->totalPCMFrameCount > 0 && pcmFrameIndex > pFlac->totalPCMFrameCount) {
             pcmFrameIndex = pFlac->totalPCMFrameCount;
         }
 
