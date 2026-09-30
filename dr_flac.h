@@ -6467,10 +6467,11 @@ static void drflac__free_from_callbacks(void* p, const drflac_allocation_callbac
 static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, drflac_seek_proc onSeek, drflac_tell_proc onTell, drflac_meta_proc onMeta, void* pUserData, void* pUserDataMD, drflac_uint64* pFirstFramePos, drflac_uint64* pSeektablePos, drflac_uint32* pSeekpointCount, drflac_allocation_callbacks* pAllocationCallbacks)
 {
     /*
-    We want to keep track of the byte position in the stream of the seektable. At the time of calling this function we know that
-    we'll be sitting on byte 42.
+    We want to keep track of the byte position in the stream of the seektable. On input, pFirstFramePos is the position we're sitting on,
+    just past the STREAMINFO block. That's byte 42 of the FLAC stream, but it can be later in the file because any ID3 tags in front of
+    the stream have been skipped.
     */
-    drflac_uint64 runningFilePos   = 42;
+    drflac_uint64 runningFilePos   = *pFirstFramePos;
     drflac_uint64 seektablePos     = 0;
     drflac_uint32 seektableSize    = 0;
     drflac_int64  fileSize         = 0;
@@ -6483,7 +6484,7 @@ static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                 hasKnownFileSize = DRFLAC_TRUE;
             }
 
-            onSeek(pUserData, (int)runningFilePos, DRFLAC_SEEK_SET);    /* Safe cast because runningFilePos should always be 42 at this point. */
+            onSeek(pUserData, (int)runningFilePos, DRFLAC_SEEK_SET);    /* Safe cast because runningFilePos is 42 plus the size of any ID3 tags at this point. */
         }
     }
 
@@ -8137,7 +8138,11 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
     consist of only a single heap allocation. To this, the size of the seek table needs to be known, which we determine when reading
     and decoding the metadata.
     */
-    firstFramePos  = 42;   /* <-- We know we are at byte 42 at this point. */
+    firstFramePos  = 42;   /* <-- We know we are at byte 42 of the FLAC stream at this point. */
+    if (init.container == drflac_container_native) {
+        /* A native stream can have ID3 tags in front of it, which drflac__init_private() skipped. runningFilePos is past them and the "fLaC" marker. */
+        firstFramePos += init.runningFilePos - 4;
+    }
     seektablePos   = 0;
     seekpointCount = 0;
     if (init.hasMetadataBlocks) {
