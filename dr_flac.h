@@ -697,6 +697,9 @@ typedef struct
     drflac_uint64 _lostPCMFramesRemaining;
     drflac_frame_header _frameHeaderAfterLoss;
 
+    /* Internal use only. The 33-bit side channel of a frame of a 32-bit stereo stream, or NULL for any other stream. This is an offset of pExtraData. */
+    drflac_int64* _pSideSamplesS64;
+
     /* The bit streamer. The raw FLAC data is fed through this object. */
     drflac_bs bs;
 
@@ -5145,10 +5148,218 @@ static drflac_bool32 drflac__decode_samples__lpc(drflac_bs* bs, drflac_uint32 bl
 }
 
 
+/*
+The side channel of a stereo frame of a 32-bit stream has 33 bits per sample, more than the 32-bit decoding path can hold, so it's decoded
+to 64-bit samples here. Its residuals still fit in 32 bits, and its predictions in 64. The subframe header has already been read, and
+bitsPerSample excludes the wasted bits.
+*/
+static drflac_bool32 drflac__read_int64_upto_33(drflac_bs* bs, unsigned int bitCount, drflac_int64* pResult)
+{
+    drflac_uint32 hi = 0;
+    drflac_uint32 lo = 0;
+    drflac_uint64 result;
+
+    DRFLAC_ASSERT(bitCount > 0 && bitCount <= 33);
+
+    if (bitCount > 32) {
+        if (!drflac__read_uint32(bs, bitCount - 32, &hi) || !drflac__read_uint32(bs, 32, &lo)) {
+            return DRFLAC_FALSE;
+        }
+    } else {
+        if (!drflac__read_uint32(bs, bitCount, &lo)) {
+            return DRFLAC_FALSE;
+        }
+    }
+
+    result = ((drflac_uint64)hi << 32) | lo;
+    if ((result >> (bitCount - 1)) & 1) {
+        result |= ~(drflac_uint64)0 << bitCount;   /* Sign extend. */
+    }
+
+    *pResult = (drflac_int64)result;
+    return DRFLAC_TRUE;
+}
+
+static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_subframe* pSubframe, drflac_uint32 blockSize, drflac_uint32 bitsPerSample, drflac_int64* pSamples)
+{
+    static const drflac_int32 fixedCoefficients[5][4] = {
+        {0,  0, 0,  0},
+        {1,  0, 0,  0},
+        {2, -1, 0,  0},
+        {3, -3, 1,  0},
+        {4, -6, 4, -1}
+    };
+    drflac_int32 coefficients[32];
+    drflac_uint32 order = pSubframe->lpcOrder;
+    drflac_int8 shift = 0;
+    drflac_uint8 residualMethod;
+    drflac_uint8 partitionOrder;
+    drflac_uint32 partition;
+    drflac_uint32 i;
+    drflac_uint32 j;
+
+    switch (pSubframe->subframeType)
+    {
+        case DRFLAC_SUBFRAME_CONSTANT:
+        {
+            drflac_int64 sample;
+            if (!drflac__read_int64_upto_33(bs, bitsPerSample, &sample)) {
+                return DRFLAC_FALSE;
+            }
+            for (i = 0; i < blockSize; ++i) {
+                pSamples[i] = sample;
+            }
+            return DRFLAC_TRUE;
+        }
+
+        case DRFLAC_SUBFRAME_VERBATIM:
+        {
+            for (i = 0; i < blockSize; ++i) {
+                if (!drflac__read_int64_upto_33(bs, bitsPerSample, pSamples + i)) {
+                    return DRFLAC_FALSE;
+                }
+            }
+            return DRFLAC_TRUE;
+        }
+
+        case DRFLAC_SUBFRAME_FIXED:
+        case DRFLAC_SUBFRAME_LPC:
+        {
+            for (i = 0; i < order; ++i) {
+                if (!drflac__read_int64_upto_33(bs, bitsPerSample, pSamples + i)) {
+                    return DRFLAC_FALSE;
+                }
+            }
+
+            DRFLAC_ZERO_MEMORY(coefficients, sizeof(coefficients));
+            if (pSubframe->subframeType == DRFLAC_SUBFRAME_FIXED) {
+                for (i = 0; i < order; ++i) {
+                    coefficients[i] = fixedCoefficients[order][i];
+                }
+            } else {
+                drflac_uint8 precision;
+                if (!drflac__read_uint8(bs, 4, &precision) || precision == 15) {
+                    return DRFLAC_FALSE;
+                }
+                if (!drflac__read_int8(bs, 5, &shift) || shift < 0) {
+                    return DRFLAC_FALSE;    /* Negative shifts are not supported. See drflac__decode_samples__lpc(). */
+                }
+                for (i = 0; i < order; ++i) {
+                    if (!drflac__read_int32(bs, precision + 1, coefficients + i)) {
+                        return DRFLAC_FALSE;
+                    }
+                }
+            }
+        } break;
+
+        default: return DRFLAC_FALSE;
+    }
+
+    /* The residual, with the same layout drflac__decode_samples_with_residual() reads, each sample predicted as it's decoded. */
+    if (!drflac__read_uint8(bs, 2, &residualMethod) || (residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE && residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE2)) {
+        return DRFLAC_FALSE;
+    }
+    if (!drflac__read_uint8(bs, 4, &partitionOrder) || partitionOrder > 8 || (blockSize >> partitionOrder) < order) {
+        return DRFLAC_FALSE;
+    }
+
+    i = order;
+    for (partition = 0; partition < (1U << partitionOrder); ++partition) {
+        drflac_uint32 count = (blockSize >> partitionOrder) - ((partition == 0) ? order : 0);
+        drflac_uint8 riceParam = 0;
+        drflac_uint8 unencodedBitsPerSample = 0;
+        drflac_bool32 isEscaped;
+        drflac_uint32 n;
+
+        if (residualMethod == DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE) {
+            if (!drflac__read_uint8(bs, 4, &riceParam)) {
+                return DRFLAC_FALSE;
+            }
+            isEscaped = riceParam == 15;
+        } else {
+            if (!drflac__read_uint8(bs, 5, &riceParam)) {
+                return DRFLAC_FALSE;
+            }
+            isEscaped = riceParam == 31;
+        }
+        if (isEscaped && !drflac__read_uint8(bs, 5, &unencodedBitsPerSample)) {
+            return DRFLAC_FALSE;
+        }
+
+        for (n = 0; n < count; ++n, ++i) {
+            drflac_int32 residual = 0;
+            drflac_int64 prediction = 0;
+
+            if (isEscaped) {
+                if (unencodedBitsPerSample > 0 && !drflac__read_int32(bs, unencodedBitsPerSample, &residual)) {
+                    return DRFLAC_FALSE;
+                }
+            } else {
+                drflac_uint32 zeroCounter;
+                drflac_uint32 riceParamPart;
+                drflac_uint32 zigzag;
+                if (!drflac__read_rice_parts_x1(bs, riceParam, &zeroCounter, &riceParamPart)) {
+                    return DRFLAC_FALSE;
+                }
+                zigzag   = (zeroCounter << riceParam) | (riceParamPart & (drflac_uint32)~((~0UL) << riceParam));  /* The part read carries the stop bit above it. */
+                residual = (drflac_int32)((zigzag >> 1) ^ (~(zigzag & 1) + 1));
+            }
+
+            for (j = 0; j < order; ++j) {
+                prediction += (drflac_int64)coefficients[j] * pSamples[i - j - 1];
+            }
+            pSamples[i] = residual + (prediction >> shift);
+        }
+    }
+
+    return DRFLAC_TRUE;
+}
+
+/*
+Replaces a stereo frame of a 32-bit stream whose side channel was decoded to 64 bits with its left and right channels, each of which fits in
+32 bits again, as independent channels in the decoded sample buffer. Each channel's wasted bits are applied here.
+*/
+static void drflac__decorrelate_frame_with_33_bit_side(drflac* pFlac)
+{
+    drflac_frame* pFrame = &pFlac->currentFLACFrame;
+    drflac_int32* pChannel0 = pFrame->subframes[0].pSamplesS32;
+    drflac_int32* pChannel1 = pFrame->subframes[1].pSamplesS32;
+    const drflac_int64* pSide = pFlac->_pSideSamplesS64;
+    drflac_uint32 shift0 = pFrame->subframes[0].wastedBitsPerSample;
+    drflac_uint32 shift1 = pFrame->subframes[1].wastedBitsPerSample;
+    drflac_uint32 i;
+
+    for (i = 0; i < pFrame->header.blockSizeInPCMFrames; ++i) {
+        drflac_int64 left;
+        drflac_int64 right;
+
+        if (pFrame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_LEFT_SIDE) {
+            left  = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel0[i] << shift0);
+            right = left - (drflac_int64)((drflac_uint64)pSide[i] << shift1);
+        } else if (pFrame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_RIGHT_SIDE) {
+            right = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel1[i] << shift1);
+            left  = (drflac_int64)((drflac_uint64)pSide[i] << shift0) + right;
+        } else {
+            drflac_int64 side = (drflac_int64)((drflac_uint64)pSide[i] << shift1);
+            drflac_int64 mid  = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel0[i] << shift0);
+            mid   = (drflac_int64)(((drflac_uint64)mid << 1) | (drflac_uint64)(side & 1));
+            left  = (mid + side) >> 1;
+            right = (mid - side) >> 1;
+        }
+
+        pChannel0[i] = (drflac_int32)left;
+        pChannel1[i] = (drflac_int32)right;
+    }
+
+    pFrame->subframes[0].wastedBitsPerSample = 0;
+    pFrame->subframes[1].wastedBitsPerSample = 0;
+    pFrame->header.channelAssignment = 1;   /* Independent stereo. */
+}
+
 static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_frame_header* header)
 {
     const drflac_uint32 sampleRateTable[12]  = {0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000};
-    const drflac_uint8 bitsPerSampleTable[8] = {0, 8, 12, (drflac_uint8)-1, 16, 20, 24, (drflac_uint8)-1};   /* -1 = reserved. */
+    const drflac_uint8 bitsPerSampleTable[8] = {0, 8, 12, (drflac_uint8)-1, 16, 20, 24, 32};   /* -1 = reserved. */
 
     DRFLAC_ASSERT(bs != NULL);
     DRFLAC_ASSERT(header != NULL);
@@ -5205,7 +5416,7 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
         if (!drflac__read_uint8(bs, 3, &bitsPerSample)) {
             return DRFLAC_FALSE;
         }
-        if (bitsPerSample == 3 || bitsPerSample == 7) {
+        if (bitsPerSample == 3) {
             continue;
         }
         crc8 = drflac_crc8(crc8, bitsPerSample, 3);
@@ -5382,7 +5593,7 @@ static drflac_bool32 drflac__read_subframe_header(drflac_bs* bs, drflac_subframe
     return DRFLAC_TRUE;
 }
 
-static drflac_bool32 drflac__decode_subframe(drflac_bs* bs, drflac_frame* frame, int subframeIndex, drflac_int32* pDecodedSamplesOut)
+static drflac_bool32 drflac__decode_subframe(drflac_bs* bs, drflac_frame* frame, int subframeIndex, drflac_int32* pDecodedSamplesOut, drflac_int64* pSideSamplesS64Out)
 {
     drflac_subframe* pSubframe;
     drflac_uint32 subframeBitsPerSample;
@@ -5404,18 +5615,26 @@ static drflac_bool32 drflac__decode_subframe(drflac_bs* bs, drflac_frame* frame,
         subframeBitsPerSample += 1;
     }
 
-    if (subframeBitsPerSample > 32) {
-        /* libFLAC and ffmpeg reject 33-bit subframes as well */
-        return DRFLAC_FALSE;
-    }
-
     /* Need to handle wasted bits per sample. */
     if (pSubframe->wastedBitsPerSample >= subframeBitsPerSample) {
         return DRFLAC_FALSE;
     }
-    subframeBitsPerSample -= pSubframe->wastedBitsPerSample;
 
     pSubframe->pSamplesS32 = pDecodedSamplesOut;
+
+    if (subframeBitsPerSample > 32) {
+        /*
+        Only the side channel of a 32-bit stream is wider, at 33 bits. It's decoded to 64 bits, whatever its wasted bits, and
+        drflac__decode_flac_frame() combines it with the other channel.
+        */
+        if (pSideSamplesS64Out == NULL || frame->header.blockSizeInPCMFrames < pSubframe->lpcOrder) {
+            return DRFLAC_FALSE;
+        }
+
+        return drflac__decode_subframe_s64(bs, pSubframe, frame->header.blockSizeInPCMFrames, subframeBitsPerSample - pSubframe->wastedBitsPerSample, pSideSamplesS64Out);
+    }
+
+    subframeBitsPerSample -= pSubframe->wastedBitsPerSample;
 
     /*
     pDecodedSamplesOut will be pointing to a buffer that was allocated with enough memory to store
@@ -5584,9 +5803,13 @@ static drflac_result drflac__decode_flac_frame(drflac* pFlac)
     }
 
     for (i = 0; i < channelCount; ++i) {
-        if (!drflac__decode_subframe(&pFlac->bs, &pFlac->currentFLACFrame, i, pFlac->pDecodedSamples + (pFlac->currentFLACFrame.header.blockSizeInPCMFrames * i))) {
+        if (!drflac__decode_subframe(&pFlac->bs, &pFlac->currentFLACFrame, i, pFlac->pDecodedSamples + (pFlac->currentFLACFrame.header.blockSizeInPCMFrames * i), pFlac->_pSideSamplesS64)) {
             return DRFLAC_ERROR;
         }
+    }
+
+    if (pFlac->bitsPerSample == 32 && pFlac->currentFLACFrame.header.channelAssignment >= DRFLAC_CHANNEL_ASSIGNMENT_LEFT_SIDE) {
+        drflac__decorrelate_frame_with_33_bit_side(pFlac);
     }
 
     paddingSizeInBits = (drflac_uint8)(DRFLAC_CACHE_L1_BITS_REMAINING(&pFlac->bs) & 7);
@@ -8094,6 +8317,7 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
     drflac_uint32 allocationSize;
     drflac_uint32 wholeSIMDVectorCountPerChannel;
     drflac_uint32 decodedSamplesAllocationSize;
+    drflac_uint32 sideSamplesS64Offset;
 #ifndef DR_FLAC_NO_OGG
     drflac_oggbs* pOggbs = NULL;
 #endif
@@ -8145,6 +8369,12 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
     }
 
     decodedSamplesAllocationSize = wholeSIMDVectorCountPerChannel * DRFLAC_MAX_SIMD_VECTOR_SIZE * init.channels;
+    sideSamplesS64Offset         = decodedSamplesAllocationSize;
+
+    /* A stereo 32-bit stream needs room for a 33-bit side channel, as 64-bit samples. The offset is a multiple of the SIMD vector size, so they're aligned. */
+    if (init.bitsPerSample == 32 && init.channels == 2) {
+        decodedSamplesAllocationSize += init.maxBlockSizeInPCMFrames * sizeof(drflac_int64);
+    }
 
     allocationSize += decodedSamplesAllocationSize;
     allocationSize += DRFLAC_MAX_SIMD_VECTOR_SIZE;  /* Allocate extra bytes to ensure we have enough for alignment. */
@@ -8227,6 +8457,9 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
     drflac__init_from_info(pFlac, &init);
     pFlac->allocationCallbacks = allocationCallbacks;
     pFlac->pDecodedSamples = (drflac_int32*)drflac_align((size_t)pFlac->pExtraData, DRFLAC_MAX_SIMD_VECTOR_SIZE);
+    if (init.bitsPerSample == 32 && init.channels == 2) {
+        pFlac->_pSideSamplesS64 = (drflac_int64*)((drflac_uint8*)pFlac->pDecodedSamples + sideSamplesS64Offset);
+    }
 
 #ifndef DR_FLAC_NO_OGG
     if (init.container == drflac_container_ogg) {
