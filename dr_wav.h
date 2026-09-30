@@ -4091,50 +4091,36 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
         if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && pWav->container == drwav_container_aiff) {
             framesInData = (dataChunkSize / fmt.blockAlign) * 64;   /* Only whole ima4 packets decode. */
-        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM || pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
-            drwav_uint64 totalBlockHeaderSizeInBytes;
-            drwav_uint64 blockCount = dataChunkSize / fmt.blockAlign;
+        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
+            /*
+            An MS ADPCM block's header is 7 bytes a channel and holds two decoded frames, and each byte after it two samples. A
+            block cut short holds its header's frames only once the whole header is there, so a header cut short counts for none.
+            */
+            drwav_uint64 headerSizeInBytes = 7 * (drwav_uint64)fmt.channels;
+            drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
 
-            /* Make sure any trailing partial block is accounted for. */
-            if ((blockCount * fmt.blockAlign) < dataChunkSize) {
-                blockCount += 1;
-            }
-
-            /* We decode two samples per byte. There will be blockCount headers in the data chunk. This is enough to know how to calculate the total PCM frame count. */
-            totalBlockHeaderSizeInBytes = blockCount * (((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) ? 6 : 4) * fmt.channels);
-            if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
+            if (fmt.blockAlign < headerSizeInBytes) {
                 framesInDataKnown = DRWAV_FALSE;
-            } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
-                /*
-                An MS ADPCM block's header is 7 bytes a channel and holds two decoded frames, and each byte after it two samples. A
-                block cut short holds its header's frames only once the whole header is there, so a header cut short counts for none.
-                */
-                drwav_uint64 headerSizeInBytes = 7 * (drwav_uint64)fmt.channels;
-                drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
-
-                if (fmt.blockAlign < headerSizeInBytes) {
-                    framesInDataKnown = DRWAV_FALSE;
-                } else {
-                    framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - headerSizeInBytes) * 2) / fmt.channels) + 2);
-                    if (bytesInPartialBlock >= headerSizeInBytes) {
-                        framesInData += 2 + ((bytesInPartialBlock - headerSizeInBytes) * 2) / fmt.channels;
-                    }
-                }
             } else {
-                /*
-                An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample, and the
-                rest of the block is groups of 4 bytes a channel, 8 frames a group, so a block cut short holds only its whole groups.
-                */
-                drwav_uint64 groupSizeInBytes = 4 * (drwav_uint64)fmt.channels;
-                drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
+                framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - headerSizeInBytes) * 2) / fmt.channels) + 2);
+                if (bytesInPartialBlock >= headerSizeInBytes) {
+                    framesInData += 2 + ((bytesInPartialBlock - headerSizeInBytes) * 2) / fmt.channels;
+                }
+            }
+        } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
+            /*
+            An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample, and the
+            rest of the block is groups of 4 bytes a channel, 8 frames a group, so a block cut short holds only its whole groups.
+            */
+            drwav_uint64 groupSizeInBytes = 4 * (drwav_uint64)fmt.channels;
+            drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
 
-                if (fmt.blockAlign < groupSizeInBytes) {
-                    framesInDataKnown = DRWAV_FALSE;
-                } else {
-                    framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - groupSizeInBytes) * 2) / fmt.channels) + 1);
-                    if (bytesInPartialBlock >= groupSizeInBytes) {
-                        framesInData += 1 + ((bytesInPartialBlock - groupSizeInBytes) / groupSizeInBytes) * 8;
-                    }
+            if (fmt.blockAlign < groupSizeInBytes) {
+                framesInDataKnown = DRWAV_FALSE;
+            } else {
+                framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - groupSizeInBytes) * 2) / fmt.channels) + 1);
+                if (bytesInPartialBlock >= groupSizeInBytes) {
+                    framesInData += 1 + ((bytesInPartialBlock - groupSizeInBytes) / groupSizeInBytes) * 8;
                 }
             }
         }
