@@ -3541,8 +3541,11 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 dataChunkSize = chunkSize;
             }
 
-            /* If we're running in sequential mode, or we're not reading metadata, we have enough now that we can get out of the loop. */
-            if (sequential || !isProcessingMetadata) {
+            /*
+            If we're running in sequential mode, or we're not reading metadata and have found the fmt chunk, we have enough now that we can
+            get out of the loop. A fmt chunk after the data chunk is legal, if unusual, and is looked for past it.
+            */
+            if (sequential || (!isProcessingMetadata && foundChunk_fmt)) {
                 break;      /* No need to keep reading beyond the data chunk. */
             } else {
                 chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
