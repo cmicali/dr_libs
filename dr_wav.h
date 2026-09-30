@@ -968,6 +968,12 @@ typedef struct
     drwav_uint64 ima4CheckpointCount;
     drwav_uint64 ima4CheckpointCapacity;
 
+    /* ADPCM only. The ADPCM readers take a few bytes at a time, so the stream is read ahead into this buffer. */
+    drwav_uint8* pADPCMBuffer;
+    drwav_uint32 adpcmBufferCapacity;
+    drwav_uint32 adpcmBufferSize;
+    drwav_uint32 adpcmBufferCursor;
+
     /* AIFF specific data. */
     struct
     {
@@ -4049,6 +4055,15 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         return DRWAV_FALSE;
     }
 
+    /* Without room for its read-ahead an ADPCM stream is read a few bytes at a time, as it used to be. */
+    if (drwav__is_compressed_format_tag(pWav->translatedFormatTag)) {
+        drwav_uint32 capacity = (fmt.blockAlign > 16384) ? fmt.blockAlign : 16384;
+        pWav->pADPCMBuffer = (drwav_uint8*)drwav__malloc_from_callbacks(capacity, &pWav->allocationCallbacks);
+        if (pWav->pADPCMBuffer != NULL) {
+            pWav->adpcmBufferCapacity = capacity;
+        }
+    }
+
     /* Without room for its checkpoints an ima4 stream still plays, and seeks by decoding from its start. */
     if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM && pWav->container == drwav_container_aiff) {
         drwav_uint64 capacity = (dataChunkSize / fmt.blockAlign) / DRWAV_IMA4_PACKETS_PER_CHECKPOINT + 1;
@@ -5987,6 +6002,7 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
     } else {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
         drwav_free(pWav->pIMA4Checkpoints, &pWav->allocationCallbacks);
+        drwav_free(pWav->pADPCMBuffer, &pWav->allocationCallbacks);
     }
 
 #ifndef DR_WAV_NO_STDIO
@@ -6202,6 +6218,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_seek_to_first_pcm_frame(drwav* pWav)
 
     pWav->readCursorInPCMFrames = 0;
     pWav->bytesRemaining = pWav->dataChunkDataSize;
+    pWav->adpcmBufferSize   = 0;
+    pWav->adpcmBufferCursor = 0;
 
     return DRWAV_TRUE;
 }
@@ -6266,6 +6284,8 @@ DRWAV_API drwav_bool32 drwav_seek_to_pcm_frame(drwav* pWav, drwav_uint64 targetF
 
                     DRWAV_ZERO_OBJECT(&pWav->msadpcm);
                     DRWAV_ZERO_OBJECT(&pWav->ima);
+                    pWav->adpcmBufferSize   = 0;
+                    pWav->adpcmBufferCursor = 0;
 
                     if (pWav->container == drwav_container_aiff) {
                         const drwav_int32* pCheckpoint = pWav->pIMA4Checkpoints + jumpIndex * 2 * channels;
@@ -6531,6 +6551,53 @@ DRWAV_API drwav_uint64 drwav_write_pcm_frames(drwav* pWav, drwav_uint64 framesTo
 }
 
 
+/* The ADPCM readers' reads of the stream, through the read-ahead buffer when there is one. */
+DRWAV_PRIVATE size_t drwav__adpcm_read(drwav* pWav, void* pBufferOut, size_t bytesToRead)
+{
+    size_t bytesRead = 0;
+
+    if (pWav->pADPCMBuffer == NULL) {
+        return pWav->onRead(pWav->pUserData, pBufferOut, bytesToRead);
+    }
+
+    while (bytesRead < bytesToRead) {
+        size_t bytesToCopy;
+
+        if (pWav->adpcmBufferCursor == pWav->adpcmBufferSize) {
+            pWav->adpcmBufferSize   = (drwav_uint32)pWav->onRead(pWav->pUserData, pWav->pADPCMBuffer, pWav->adpcmBufferCapacity);
+            pWav->adpcmBufferCursor = 0;
+            if (pWav->adpcmBufferSize == 0) {
+                break;
+            }
+        }
+
+        bytesToCopy = pWav->adpcmBufferSize - pWav->adpcmBufferCursor;
+        if (bytesToCopy > bytesToRead - bytesRead) {
+            bytesToCopy = bytesToRead - bytesRead;
+        }
+
+        DRWAV_COPY_MEMORY((drwav_uint8*)pBufferOut + bytesRead, pWav->pADPCMBuffer + pWav->adpcmBufferCursor, bytesToCopy);
+        pWav->adpcmBufferCursor += (drwav_uint32)bytesToCopy;
+        bytesRead += bytesToCopy;
+    }
+
+    return bytesRead;
+}
+
+/* Skips bytes of the stream, taking what the read-ahead buffer holds first. */
+DRWAV_PRIVATE void drwav__adpcm_skip(drwav* pWav, drwav_uint32 bytesToSkip)
+{
+    drwav_uint32 buffered = pWav->adpcmBufferSize - pWav->adpcmBufferCursor;
+    if (buffered > bytesToSkip) {
+        buffered = bytesToSkip;
+    }
+
+    pWav->adpcmBufferCursor += buffered;
+    if (bytesToSkip > buffered) {
+        pWav->onSeek(pWav->pUserData, (int)(bytesToSkip - buffered), DRWAV_SEEK_CUR);
+    }
+}
+
 DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav_uint64 framesToRead, drwav_int16* pBufferOut)
 {
     drwav_uint64 totalFramesRead = 0;
@@ -6555,7 +6622,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
             if (pWav->channels == 1) {
                 /* Mono. */
                 drwav_uint8 header[7];
-                if (pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
+                if (drwav__adpcm_read(pWav, header, sizeof(header)) != sizeof(header)) {
                     return totalFramesRead;
                 }
                 pWav->msadpcm.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
@@ -6575,7 +6642,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
             } else {
                 /* Stereo. */
                 drwav_uint8 header[14];
-                if (pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
+                if (drwav__adpcm_read(pWav, header, sizeof(header)) != sizeof(header)) {
                     return totalFramesRead;
                 }
                 pWav->msadpcm.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
@@ -6637,7 +6704,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 drwav_int32 nibble0;
                 drwav_int32 nibble1;
 
-                if (pWav->onRead(pWav->pUserData, &nibbles, 1) != 1) {
+                if (drwav__adpcm_read(pWav, &nibbles, 1) != 1) {
                     return totalFramesRead;
                 }
                 pWav->msadpcm.bytesRemainingInBlock -= 1;
@@ -6760,7 +6827,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
                 /* AIFF-C ima4. A packet of every channel, each decoded whole into the cache. */
                 drwav_uint8 packet[68];
                 drwav_uint32 packetSize = 34 * pWav->channels;
-                if (pWav->onRead(pWav->pUserData, packet, packetSize) != packetSize) {
+                if (drwav__adpcm_read(pWav, packet, packetSize) != packetSize) {
                     return totalFramesRead;
                 }
 
@@ -6812,13 +6879,13 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
             } else if (pWav->channels == 1) {
                 /* Mono. */
                 drwav_uint8 header[4];
-                if (pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
+                if (drwav__adpcm_read(pWav, header, sizeof(header)) != sizeof(header)) {
                     return totalFramesRead;
                 }
                 pWav->ima.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
 
                 if (header[2] >= drwav_countof(stepTable)) {
-                    pWav->onSeek(pWav->pUserData, pWav->ima.bytesRemainingInBlock, DRWAV_SEEK_CUR);
+                    drwav__adpcm_skip(pWav, pWav->ima.bytesRemainingInBlock);
                     pWav->ima.bytesRemainingInBlock = 0;
                     return totalFramesRead; /* Invalid data. */
                 }
@@ -6830,13 +6897,13 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
             } else {
                 /* Stereo. */
                 drwav_uint8 header[8];
-                if (pWav->onRead(pWav->pUserData, header, sizeof(header)) != sizeof(header)) {
+                if (drwav__adpcm_read(pWav, header, sizeof(header)) != sizeof(header)) {
                     return totalFramesRead;
                 }
                 pWav->ima.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
 
                 if (header[2] >= drwav_countof(stepTable) || header[6] >= drwav_countof(stepTable)) {
-                    pWav->onSeek(pWav->pUserData, pWav->ima.bytesRemainingInBlock, DRWAV_SEEK_CUR);
+                    drwav__adpcm_skip(pWav, pWav->ima.bytesRemainingInBlock);
                     pWav->ima.bytesRemainingInBlock = 0;
                     return totalFramesRead; /* Invalid data. */
                 }
@@ -6888,7 +6955,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
                 for (iChannel = 0; iChannel < pWav->channels; ++iChannel) {
                     drwav_uint32 iByte;
                     drwav_uint8 nibbles[4];
-                    if (pWav->onRead(pWav->pUserData, &nibbles, 4) != 4) {
+                    if (drwav__adpcm_read(pWav, &nibbles, 4) != 4) {
                         pWav->ima.cachedFrameCount = 0;
                         return totalFramesRead;
                     }
