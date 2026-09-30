@@ -12260,20 +12260,20 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
         /* If the target sample and the current sample are in the same frame we just move the position forward. */
         if (drflac__is_current_flac_frame_valid(pFlac)) {
             if (pcmFrameIndex > pFlac->currentPCMFrame) {
-                /* Forward. */
-                drflac_uint32 offset = (drflac_uint32)(pcmFrameIndex - pFlac->currentPCMFrame);
+                /* Forward. The distance stays 64-bit until it's known to be inside the frame, or a jump of 2^32 PCM frames wraps into it. */
+                drflac_uint64 offset = pcmFrameIndex - pFlac->currentPCMFrame;
                 if (pFlac->currentFLACFrame.pcmFramesRemaining > offset) {
-                    pFlac->currentFLACFrame.pcmFramesRemaining -= offset;
+                    pFlac->currentFLACFrame.pcmFramesRemaining -= (drflac_uint32)offset;
                     pFlac->currentPCMFrame = pcmFrameIndex;
                     return DRFLAC_TRUE;
                 }
             } else {
                 /* Backward. */
-                drflac_uint32 offsetAbs = (drflac_uint32)(pFlac->currentPCMFrame - pcmFrameIndex);
+                drflac_uint64 offsetAbs = pFlac->currentPCMFrame - pcmFrameIndex;
                 drflac_uint32 currentFLACFramePCMFrameCount = pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
                 drflac_uint32 currentFLACFramePCMFramesConsumed = currentFLACFramePCMFrameCount - pFlac->currentFLACFrame.pcmFramesRemaining;
                 if (currentFLACFramePCMFramesConsumed > offsetAbs) {
-                    pFlac->currentFLACFrame.pcmFramesRemaining += offsetAbs;
+                    pFlac->currentFLACFrame.pcmFramesRemaining += (drflac_uint32)offsetAbs;
                     pFlac->currentPCMFrame = pcmFrameIndex;
                     return DRFLAC_TRUE;
                 }
