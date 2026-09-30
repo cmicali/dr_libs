@@ -6305,6 +6305,21 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
 }
 
 
+/*
+More bytes than pcmFrameCount PCM frames and one more FLAC frame can take in the stream. Eight bytes a sample leaves room for the 33 bits of
+a side channel's and for every frame's headers and footers. It bounds the search for a FLAC frame, which starts within one FLAC frame of
+any byte of a stream, and screens out seekpoints whose offsets are garbage.
+*/
+static drflac_uint64 drflac__get_max_bytes_of_pcm_frames(drflac* pFlac, drflac_uint64 pcmFrameCount)
+{
+    if (pcmFrameCount > ((drflac_uint64)1 << 48)) {
+        return ~(drflac_uint64)0;
+    }
+
+    return (pcmFrameCount + pFlac->maxBlockSizeInPCMFrames) * pFlac->channels * 8;
+}
+
+
 #if !defined(DR_FLAC_NO_CRC)
 /*
 Finds the first FLAC frame at or after the current position whose frame header and whole-frame CRC check out, and decodes it. The
@@ -6476,6 +6491,11 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
         return DRFLAC_FALSE;
     }
 
+    /* A damaged seek table can have an offset no stream could reach, and a seek to it would be a long walk to nowhere. */
+    if (pFlac->pSeekpoints[iClosestSeekpoint].flacFrameOffset > drflac__get_max_bytes_of_pcm_frames(pFlac, pFlac->pSeekpoints[iClosestSeekpoint].firstPCMFrame)) {
+        return DRFLAC_FALSE;
+    }
+
 #if !defined(DR_FLAC_NO_CRC)
     /* At this point we should know the closest seek point. We can use a binary search for this. We need to know the total sample count for this. */
     if (pFlac->totalPCMFrameCount > 0) {
@@ -6500,7 +6520,7 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
                 return DRFLAC_FALSE;    /* The next seekpoint doesn't look right. The seek table cannot be trusted from here. Abort. */
             }
 
-            if (pFlac->pSeekpoints[iNextSeekpoint].firstPCMFrame != (((drflac_uint64)0xFFFFFFFF << 32) | 0xFFFFFFFF)) { /* Make sure it's not a placeholder seekpoint. */
+            if (pFlac->pSeekpoints[iNextSeekpoint].firstPCMFrame != (((drflac_uint64)0xFFFFFFFF << 32) | 0xFFFFFFFF) && pFlac->pSeekpoints[iNextSeekpoint].flacFrameOffset <= drflac__get_max_bytes_of_pcm_frames(pFlac, pFlac->pSeekpoints[iNextSeekpoint].firstPCMFrame)) { /* Make sure it's not a placeholder seekpoint, nor garbage. */
                 byteRangeHi = pFlac->firstFLACFramePosInBytes + pFlac->pSeekpoints[iNextSeekpoint].flacFrameOffset - 1; /* byteRangeHi must be zero based. */
             }
         }
