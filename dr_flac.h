@@ -4881,8 +4881,8 @@ static drflac_bool32 drflac__decode_samples_with_residual(drflac_bs* bs, drflac_
         return DRFLAC_FALSE;
     }
 
-    /* Validation check. */
-    if ((blockSize / (1 << partitionOrder)) < lpcOrder) {
+    /* Validation check. The partitions must divide the block evenly, or the samples past the last whole partition are never written. */
+    if ((blockSize / (1 << partitionOrder)) < lpcOrder || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
     }
 
@@ -4973,7 +4973,7 @@ static drflac_bool32 drflac__read_and_seek_residual(drflac_bs* bs, drflac_uint32
     }
 
     /* Validation check. This must match drflac__decode_samples_with_residual(): the first partition can legally hold no residuals. */
-    if ((blockSize / (1 << partitionOrder)) < order) {
+    if ((blockSize / (1 << partitionOrder)) < order || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
     }
 
