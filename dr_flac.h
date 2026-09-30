@@ -5361,13 +5361,19 @@ static void drflac__decorrelate_frame_with_33_bit_side(drflac* pFlac)
     pFrame->header.channelAssignment = 1;   /* Independent stereo. */
 }
 
-static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_frame_header* header)
+/*
+Reads the next frame header. *pHeaderOut is only written when a header is found: the fields of a candidate that turns out to be a false
+sync code must not end up in the caller's header.
+*/
+static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_uint8 streaminfoBitsPerSample, drflac_frame_header* pHeaderOut)
 {
     const drflac_uint32 sampleRateTable[12]  = {0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000};
     const drflac_uint8 bitsPerSampleTable[8] = {0, 8, 12, (drflac_uint8)-1, 16, 20, 24, 32};   /* -1 = reserved. */
+    drflac_frame_header candidate;
+    drflac_frame_header* header = &candidate;
 
     DRFLAC_ASSERT(bs != NULL);
-    DRFLAC_ASSERT(header != NULL);
+    DRFLAC_ASSERT(pHeaderOut != NULL);
 
     /* Keep looping until we find a valid sync code. */
     for (;;) {
@@ -5536,6 +5542,7 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             continue;    /* CRC mismatch. Loop back to the top and find the next sync code. */
         }
 #endif
+        *pHeaderOut = candidate;
         return DRFLAC_TRUE;
     }
 }
