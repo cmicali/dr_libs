@@ -689,6 +689,14 @@ typedef struct
     drflac_bool32 _noBinarySearchSeek : 1;
     drflac_bool32 _noBruteForceSeek   : 1;
 
+    /*
+    Internal use only. Set while silence stands in for FLAC frames lost to a damaged header: the PCM frames of it still to be delivered,
+    then the frame whose header showed the loss, which has been read but not yet decoded.
+    */
+    drflac_bool32 _hasFrameHeaderAfterLoss : 1;
+    drflac_uint64 _lostPCMFramesRemaining;
+    drflac_frame_header _frameHeaderAfterLoss;
+
     /* The bit streamer. The raw FLAC data is fed through this object. */
     drflac_bs bs;
 
@@ -5656,27 +5664,140 @@ error:
     return result;
 }
 
-static drflac_bool32 drflac__read_and_decode_next_flac_frame(drflac* pFlac)
+/*
+Makes the current FLAC frame blockSize PCM frames of silence. It stands in for a damaged frame, so every later frame stays where it belongs
+in the stream, as libFLAC does.
+*/
+static void drflac__make_current_flac_frame_silent(drflac* pFlac, drflac_uint16 blockSize)
 {
+    drflac_uint32 iChannel;
+
     DRFLAC_ASSERT(pFlac != NULL);
+    DRFLAC_ASSERT(blockSize <= pFlac->maxBlockSizeInPCMFrames);
 
-    for (;;) {
-        drflac_result result;
+    DRFLAC_ZERO_MEMORY(pFlac->pDecodedSamples, (size_t)blockSize * pFlac->channels * sizeof(drflac_int32));
+    DRFLAC_ZERO_MEMORY(pFlac->currentFLACFrame.subframes, sizeof(pFlac->currentFLACFrame.subframes));
+    for (iChannel = 0; iChannel < pFlac->channels; iChannel += 1) {
+        pFlac->currentFLACFrame.subframes[iChannel].pSamplesS32 = pFlac->pDecodedSamples + ((size_t)blockSize * iChannel);
+    }
 
-        if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+    /* Independent channels, because a damaged header's channel assignment need not match the stream's channel count. */
+    pFlac->currentFLACFrame.header.channelAssignment    = (drflac_uint8)(pFlac->channels - 1);
+    pFlac->currentFLACFrame.header.blockSizeInPCMFrames = blockSize;
+    pFlac->currentFLACFrame.pcmFramesRemaining          = blockSize;
+}
+
+/*
+Whether the FLAC frame with header pNext can be the one after the frame with header pPrevious. *pLostPCMFrames is set to the PCM frames
+between them, lost to a damaged header whose frame was passed over looking for the next sync code. With no previous frame, only the first
+frame of the stream follows. A frame that starts before the previous one ends, or would end past the end of the stream, does not: it's far
+more likely a false sync code than the other side of a gap.
+*/
+static drflac_bool32 drflac__is_next_flac_frame(drflac* pFlac, const drflac_frame_header* pPrevious, const drflac_frame_header* pNext, drflac_uint64* pLostPCMFrames)
+{
+    drflac_uint64 previousEnd;
+    drflac_uint64 nextStart;
+
+    *pLostPCMFrames = 0;
+
+    if (pPrevious->blockSizeInPCMFrames == 0) {
+        return pNext->pcmFrameNumber == 0 && pNext->flacFrameNumber == 0;
+    }
+
+    if (pPrevious->pcmFrameNumber != 0 || pNext->pcmFrameNumber != 0) {
+        /* Variable block sizes: frames are numbered by their first PCM frame. */
+        previousEnd = pPrevious->pcmFrameNumber + pPrevious->blockSizeInPCMFrames;
+        nextStart   = pNext->pcmFrameNumber;
+    } else {
+        /* Fixed block sizes: frames are numbered in order, and every frame but the last has the previous frame's block size. */
+        previousEnd = ((drflac_uint64)pPrevious->flacFrameNumber + 1) * pPrevious->blockSizeInPCMFrames;
+        nextStart   =  (drflac_uint64)pNext->flacFrameNumber           * pPrevious->blockSizeInPCMFrames;
+    }
+
+    if (nextStart < previousEnd) {
+        return DRFLAC_FALSE;
+    }
+
+    if (nextStart > previousEnd) {
+        if (pFlac->totalPCMFrameCount == 0 || nextStart + pNext->blockSizeInPCMFrames > pFlac->totalPCMFrameCount) {
             return DRFLAC_FALSE;
         }
 
-        result = drflac__decode_flac_frame(pFlac);
-        if (result != DRFLAC_SUCCESS) {
-            if (result == DRFLAC_CRC_MISMATCH) {
-                continue;   /* CRC mismatch. Skip to the next frame. */
-            } else {
+        *pLostPCMFrames = nextStart - previousEnd;
+    }
+
+    return DRFLAC_TRUE;
+}
+
+static drflac_bool32 drflac__read_and_decode_next_flac_frame(drflac* pFlac)
+{
+    drflac_frame_header previousHeader;
+
+    DRFLAC_ASSERT(pFlac != NULL);
+
+    /* The frame just consumed. Headers that turn out to be false sync codes must not replace it. */
+    previousHeader = pFlac->currentFLACFrame.header;
+
+    for (;;) {
+        drflac_uint64 lostPCMFrames;
+        drflac_bool32 isNextFrame;
+        drflac_result result;
+
+        /* Silence standing in for FLAC frames lost to a damaged header comes before the frame whose header showed the loss. */
+        if (pFlac->_lostPCMFramesRemaining > 0) {
+            drflac_uint16 blockSize = pFlac->maxBlockSizeInPCMFrames;
+            if (pFlac->_lostPCMFramesRemaining < blockSize) {
+                blockSize = (drflac_uint16)pFlac->_lostPCMFramesRemaining;
+            }
+
+            pFlac->_lostPCMFramesRemaining -= blockSize;
+            drflac__make_current_flac_frame_silent(pFlac, blockSize);
+            return DRFLAC_TRUE;
+        }
+
+        if (pFlac->_hasFrameHeaderAfterLoss) {
+            pFlac->currentFLACFrame.header  = pFlac->_frameHeaderAfterLoss;
+            pFlac->_hasFrameHeaderAfterLoss = DRFLAC_FALSE;
+            isNextFrame = DRFLAC_TRUE;
+        } else {
+            if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
                 return DRFLAC_FALSE;
+            }
+
+            isNextFrame = drflac__is_next_flac_frame(pFlac, &previousHeader, &pFlac->currentFLACFrame.header, &lostPCMFrames);
+            if (isNextFrame && lostPCMFrames > 0) {
+                /* The stream is sitting just past this frame's header, which is where decoding it will start once the silence is delivered. */
+                pFlac->_frameHeaderAfterLoss    = pFlac->currentFLACFrame.header;
+                pFlac->_hasFrameHeaderAfterLoss = DRFLAC_TRUE;
+                pFlac->_lostPCMFramesRemaining  = lostPCMFrames;
+                continue;
             }
         }
 
-        return DRFLAC_TRUE;
+        result = drflac__decode_flac_frame(pFlac);
+        if (result == DRFLAC_SUCCESS) {
+            return DRFLAC_TRUE;
+        }
+        if (result == DRFLAC_AT_END) {
+            return DRFLAC_FALSE;
+        }
+
+        /*
+        A CRC mismatch, or a frame that could not be decoded. If it's the frame after the previous one it's a damaged frame, and silence
+        takes its place. Otherwise it's a false sync code, so keep looking.
+        */
+        if (isNextFrame && pFlac->currentFLACFrame.header.blockSizeInPCMFrames <= pFlac->maxBlockSizeInPCMFrames) {
+            if (result != DRFLAC_CRC_MISMATCH) {
+                /* Decoding stopped inside the frame. If the stream ends there too, the frame was cut short rather than damaged, and the stream ends with the frame before it. */
+                drflac_uint8 nextByte;
+                if (!drflac__read_uint8(&pFlac->bs, 8, &nextByte)) {
+                    return DRFLAC_FALSE;
+                }
+            }
+
+            drflac__make_current_flac_frame_silent(pFlac, pFlac->currentFLACFrame.header.blockSizeInPCMFrames);
+            return DRFLAC_TRUE;
+        }
     }
 }
 
@@ -5715,6 +5836,8 @@ static drflac_bool32 drflac__seek_to_first_frame(drflac* pFlac)
 
     DRFLAC_ZERO_MEMORY(&pFlac->currentFLACFrame, sizeof(pFlac->currentFLACFrame));
     pFlac->currentPCMFrame = 0;
+    pFlac->_lostPCMFramesRemaining  = 0;
+    pFlac->_hasFrameHeaderAfterLoss = DRFLAC_FALSE;
 
     return result;
 }
@@ -5809,16 +5932,21 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
 
             if (!isMidFrame) {
                 drflac_result result = drflac__decode_flac_frame(pFlac);
-                if (result == DRFLAC_SUCCESS) {
-                    /* The frame is valid. We just need to skip over some samples to ensure it's sample-exact. */
-                    return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;  /* <-- If this fails, something bad has happened (it should never fail). */
-                } else {
-                    if (result == DRFLAC_CRC_MISMATCH) {
-                        goto next_iteration;   /* CRC mismatch. Pretend this frame never existed. */
-                    } else {
+                if (result == DRFLAC_AT_END) {
+                    return DRFLAC_FALSE;
+                }
+
+                if (result != DRFLAC_SUCCESS) {
+                    /* A damaged frame. Silence takes its place, as it does when decoding. */
+                    if (pFlac->currentFLACFrame.header.blockSizeInPCMFrames > pFlac->maxBlockSizeInPCMFrames) {
                         return DRFLAC_FALSE;
                     }
+
+                    drflac__make_current_flac_frame_silent(pFlac, pFlac->currentFLACFrame.header.blockSizeInPCMFrames);
                 }
+
+                /* We just need to skip over some samples to ensure it's sample-exact. */
+                return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;  /* <-- If this fails, something bad has happened (it should never fail). */
             } else {
                 /* We started seeking mid-frame which means we need to skip the frame decoding part. */
                 return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;
@@ -5830,14 +5958,13 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
             */
             if (!isMidFrame) {
                 drflac_result result = drflac__seek_to_next_flac_frame(pFlac);
-                if (result == DRFLAC_SUCCESS) {
+                if (result == DRFLAC_AT_END) {
+                    return DRFLAC_FALSE;
+                }
+
+                /* A damaged frame still takes up its place in the stream, since decoding puts silence there. */
+                if (result == DRFLAC_SUCCESS || pFlac->currentFLACFrame.header.blockSizeInPCMFrames <= pFlac->maxBlockSizeInPCMFrames) {
                     runningPCMFrameCount += pcmFrameCountInThisFLACFrame;
-                } else {
-                    if (result == DRFLAC_CRC_MISMATCH) {
-                        goto next_iteration;   /* CRC mismatch. Pretend this frame never existed. */
-                    } else {
-                        return DRFLAC_FALSE;
-                    }
                 }
             } else {
                 /*
@@ -5855,7 +5982,6 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
             }
         }
 
-    next_iteration:
         /* Grab the next frame in preparation for the next iteration. */
         if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
             return DRFLAC_FALSE;
@@ -6123,16 +6249,21 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
 
             if (!isMidFrame) {
                 drflac_result result = drflac__decode_flac_frame(pFlac);
-                if (result == DRFLAC_SUCCESS) {
-                    /* The frame is valid. We just need to skip over some samples to ensure it's sample-exact. */
-                    return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;  /* <-- If this fails, something bad has happened (it should never fail). */
-                } else {
-                    if (result == DRFLAC_CRC_MISMATCH) {
-                        goto next_iteration;   /* CRC mismatch. Pretend this frame never existed. */
-                    } else {
+                if (result == DRFLAC_AT_END) {
+                    return DRFLAC_FALSE;
+                }
+
+                if (result != DRFLAC_SUCCESS) {
+                    /* A damaged frame. Silence takes its place, as it does when decoding. */
+                    if (pFlac->currentFLACFrame.header.blockSizeInPCMFrames > pFlac->maxBlockSizeInPCMFrames) {
                         return DRFLAC_FALSE;
                     }
+
+                    drflac__make_current_flac_frame_silent(pFlac, pFlac->currentFLACFrame.header.blockSizeInPCMFrames);
                 }
+
+                /* We just need to skip over some samples to ensure it's sample-exact. */
+                return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;  /* <-- If this fails, something bad has happened (it should never fail). */
             } else {
                 /* We started seeking mid-frame which means we need to skip the frame decoding part. */
                 return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;
@@ -6144,14 +6275,13 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
             */
             if (!isMidFrame) {
                 drflac_result result = drflac__seek_to_next_flac_frame(pFlac);
-                if (result == DRFLAC_SUCCESS) {
+                if (result == DRFLAC_AT_END) {
+                    return DRFLAC_FALSE;
+                }
+
+                /* A damaged frame still takes up its place in the stream, since decoding puts silence there. */
+                if (result == DRFLAC_SUCCESS || pFlac->currentFLACFrame.header.blockSizeInPCMFrames <= pFlac->maxBlockSizeInPCMFrames) {
                     runningPCMFrameCount += pcmFrameCountInThisFLACFrame;
-                } else {
-                    if (result == DRFLAC_CRC_MISMATCH) {
-                        goto next_iteration;   /* CRC mismatch. Pretend this frame never existed. */
-                    } else {
-                        return DRFLAC_FALSE;
-                    }
                 }
             } else {
                 /*
@@ -6169,7 +6299,6 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
             }
         }
 
-    next_iteration:
         /* Grab the next frame in preparation for the next iteration. */
         if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
             return DRFLAC_FALSE;
@@ -11739,6 +11868,17 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
                     return DRFLAC_TRUE;
                 }
             }
+        }
+
+        /*
+        While silence stands in for lost FLAC frames the stream is sitting past the header of the frame after them, which the seek methods
+        that carry on from the current position can't account for. Start from the first frame instead.
+        */
+        if (pFlac->_lostPCMFramesRemaining > 0 || pFlac->_hasFrameHeaderAfterLoss) {
+            if (!drflac__seek_to_first_frame(pFlac)) {
+                return DRFLAC_FALSE;
+            }
+            originalPCMFrame = 0;
         }
 
         /*
