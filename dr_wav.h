@@ -3182,6 +3182,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     drwav_uint64 dataChunkSize = 0;             /* <-- Important! Don't explicitly set this to 0 anywhere else. Calculation of the size of the data chunk is performed in different paths depending on the container. */
     drwav_uint64 sampleCountFromFactChunk = 0;  /* Same as dataChunkSize - make sure this is the only place this is initialized to 0. */
     drwav_uint64 metadataStartPos;
+    drwav_uint64 streamSize = 0;
+    drwav_bool32 streamSizeKnown = DRWAV_FALSE;
     drwav__metadata_parser metadataParser;
     drwav_bool8 isProcessingMetadata = DRWAV_FALSE;
     drwav_bool8 foundChunk_fmt  = DRWAV_FALSE;
@@ -3349,6 +3351,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             return DRWAV_FALSE; /* Expecting "ds64". */
         }
 
+        if (header.sizeInBytes < 24) {
+            return DRWAV_FALSE; /* Too small for the three sizes read below. */
+        }
+
         bytesRemainingInChunk = header.sizeInBytes + header.paddingSize;
 
         /* We don't care about the size of the RIFF chunk - skip it. */
@@ -3383,6 +3389,22 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     }
 
 
+    /*
+    The stream's size, where it can be found, bounds the chunk walk: a chunk that claims to run past the end of the stream ends the walk,
+    rather than being skipped. A skip is made 2 GB at a time, so a W64 chunk of a 64-bit size could otherwise take billions of seeks.
+    */
+    if (!sequential && pWav->onTell != NULL) {
+        drwav_int64 size;
+        if (pWav->onSeek(pWav->pUserData, 0, DRWAV_SEEK_END) && pWav->onTell(pWav->pUserData, &size) && size >= 0) {
+            streamSize      = (drwav_uint64)size;
+            streamSizeKnown = DRWAV_TRUE;
+        }
+
+        if (drwav__seek_from_start(pWav->onSeek, cursor, pWav->pUserData) == DRWAV_FALSE) {
+            return DRWAV_FALSE;
+        }
+    }
+
     metadataStartPos = cursor;
 
     /* Don't allow processing of metadata with untested containers. */
@@ -3407,6 +3429,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     for (;;) {  /* For each chunk... */
         drwav_chunk_header header;
         drwav_uint64 chunkSize;
+        drwav_bool32 chunkRunsPastEnd;
 
         result = drwav__read_chunk_header(pWav->onRead, pWav->pUserData, pWav->container, &cursor, &header);
         if (result != DRWAV_SUCCESS) {
@@ -3414,6 +3437,15 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         }
 
         chunkSize = header.sizeInBytes;
+
+        /* A data chunk cut short keeps what it holds, and is the stream's last. Any other chunk that runs past the end is damage, and ends the walk. */
+        chunkRunsPastEnd = streamSizeKnown && (cursor > streamSize || chunkSize > streamSize - cursor);
+        if (chunkRunsPastEnd &&
+            !(((pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx || pWav->container == drwav_container_rf64) && drwav_fourcc_equal(header.id.fourcc, "data")) ||
+              ((pWav->container == drwav_container_w64)  && drwav_guid_equal(header.id.guid, drwavGUID_W64_DATA)) ||
+              ((pWav->container == drwav_container_aiff) && drwav_fourcc_equal(header.id.fourcc, "SSND")))) {
+            break;
+        }
 
 
         /*
@@ -3545,7 +3577,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             If we're running in sequential mode, or we're not reading metadata and have found the fmt chunk, we have enough now that we can
             get out of the loop. A fmt chunk after the data chunk is legal, if unusual, and is looked for past it.
             */
-            if (sequential || (!isProcessingMetadata && foundChunk_fmt)) {
+            if (sequential || (!isProcessingMetadata && foundChunk_fmt) || chunkRunsPastEnd) {
                 break;      /* No need to keep reading beyond the data chunk. */
             } else {
                 chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
@@ -3739,6 +3771,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
             foundChunk_data = DRWAV_TRUE;
 
+            if (chunkSize < sizeof(offsetAndBlockSizeData)) {
+                return DRWAV_FALSE; /* Too small for the offset and block size fields. */
+            }
+
             if (drwav__on_read(pWav->onRead, pWav->pUserData, offsetAndBlockSizeData, sizeof(offsetAndBlockSizeData), &cursor) != sizeof(offsetAndBlockSizeData)) {
                 return DRWAV_FALSE;
             }
@@ -3780,6 +3816,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     return DRWAV_FALSE;
                 }
             } else {
+                if (chunkRunsPastEnd) {
+                    break;  /* Nothing follows an SSND chunk cut short. */
+                }
+
                 chunkSize += header.paddingSize;                /* <-- Make sure we seek past the padding. */
                 chunkSize -= sizeof(offsetAndBlockSizeData);    /* <-- This was read earlier. */
 
@@ -3897,8 +3937,14 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     */
     if (pWav->onTell != NULL && pWav->onSeek != NULL) {
         if (pWav->onSeek(pWav->pUserData, 0, DRWAV_SEEK_END) == DRWAV_TRUE) {
-            drwav_int64 fileSize;
-            if (pWav->onTell(pWav->pUserData, &fileSize) && fileSize >= 0 && (drwav_uint64)fileSize >= pWav->dataChunkDataPos) {
+            drwav_int64 fileSize = -1;
+            if (!pWav->onTell(pWav->pUserData, &fileSize)) {
+                fileSize = -1;
+            }
+
+            if (fileSize >= 0 && (drwav_uint64)fileSize < pWav->dataChunkDataPos) {
+                dataChunkSize = 0;  /* The audio starts past the end, as an SSND offset can put it. */
+            } else if (fileSize >= 0) {
                 drwav_uint64 bytesAfterDataPos = (drwav_uint64)fileSize - pWav->dataChunkDataPos;
 
                 /*
