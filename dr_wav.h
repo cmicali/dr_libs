@@ -946,6 +946,7 @@ typedef struct
         drwav_int32  cachedFrames[4];  /* Samples are stored in this cache during decoding. */
         drwav_uint32 cachedFrameCount;
         drwav_int32  prevFrames[2][2]; /* The previous 2 samples for each channel (2 channels at most). */
+        drwav_bool32 silentBlock;      /* The current block's header is damaged, so its frames are silence. */
     } msadpcm;
 
     /* IMA ADPCM specific data. */
@@ -957,6 +958,7 @@ typedef struct
         drwav_int32  cachedFrames[128]; /* Samples are stored in this cache during decoding. An AIFF-C ima4 packet decodes to 64 frames. */
         drwav_uint32 cachedFrameCount;
         drwav_uint64 packetIndex;       /* AIFF-C ima4 only. The next packet to decode. */
+        drwav_bool32 silentBlock;       /* The current block's header is damaged, so its frames are silence. */
     } ima;
 
     /*
@@ -6633,20 +6635,6 @@ DRWAV_PRIVATE size_t drwav__adpcm_read(drwav* pWav, void* pBufferOut, size_t byt
     return bytesRead;
 }
 
-/* Skips bytes of the stream, taking what the read-ahead buffer holds first. */
-DRWAV_PRIVATE void drwav__adpcm_skip(drwav* pWav, drwav_uint32 bytesToSkip)
-{
-    drwav_uint32 buffered = pWav->adpcmBufferSize - pWav->adpcmBufferCursor;
-    if (buffered > bytesToSkip) {
-        buffered = bytesToSkip;
-    }
-
-    pWav->adpcmBufferCursor += buffered;
-    if (bytesToSkip > buffered) {
-        pWav->onSeek(pWav->pUserData, (int)(bytesToSkip - buffered), DRWAV_SEEK_CUR);
-    }
-}
-
 DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav_uint64 framesToRead, drwav_int16* pBufferOut)
 {
     drwav_uint64 totalFramesRead = 0;
@@ -6684,9 +6672,13 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 pWav->msadpcm.cachedFrames[3]  = pWav->msadpcm.prevFrames[0][1];
                 pWav->msadpcm.cachedFrameCount = 2;
 
-                /* The predictor is used as an index into coeff1Table so we'll need to validate to ensure it never overflows. */
-                if (pWav->msadpcm.predictor[0] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[0] >= drwav_countof(coeff2Table)) {
-                    return totalFramesRead; /* Invalid file. */
+                /*
+                The predictor is used as an index into coeff1Table so we'll need to validate to ensure it never overflows. A block whose
+                predictor is out of range is damaged: it keeps its frames in the timeline, as silence, and the blocks after it play.
+                */
+                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[0] >= drwav_countof(coeff2Table));
+                if (pWav->msadpcm.silentBlock) {
+                    pWav->msadpcm.predictor[0] = 0;
                 }
             } else {
                 /* Stereo. */
@@ -6711,10 +6703,12 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 pWav->msadpcm.cachedFrames[3] = pWav->msadpcm.prevFrames[1][1];
                 pWav->msadpcm.cachedFrameCount = 2;
 
-                /* The predictor is used as an index into coeff1Table so we'll need to validate to ensure it never overflows. */
-                if (pWav->msadpcm.predictor[0] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[0] >= drwav_countof(coeff2Table) ||
-                    pWav->msadpcm.predictor[1] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[1] >= drwav_countof(coeff2Table)) {
-                    return totalFramesRead; /* Invalid file. */
+                /* As for mono. */
+                pWav->msadpcm.silentBlock = (pWav->msadpcm.predictor[0] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[0] >= drwav_countof(coeff2Table) ||
+                                             pWav->msadpcm.predictor[1] >= drwav_countof(coeff1Table) || pWav->msadpcm.predictor[1] >= drwav_countof(coeff2Table));
+                if (pWav->msadpcm.silentBlock) {
+                    pWav->msadpcm.predictor[0] = 0;
+                    pWav->msadpcm.predictor[1] = 0;
                 }
             }
         }
@@ -6724,7 +6718,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
             if (pBufferOut != NULL) {
                 drwav_uint32 iSample = 0;
                 for (iSample = 0; iSample < pWav->channels; iSample += 1) {
-                    pBufferOut[iSample] = (drwav_int16)pWav->msadpcm.cachedFrames[(drwav_countof(pWav->msadpcm.cachedFrames) - (pWav->msadpcm.cachedFrameCount*pWav->channels)) + iSample];
+                    pBufferOut[iSample] = pWav->msadpcm.silentBlock ? 0 : (drwav_int16)pWav->msadpcm.cachedFrames[(drwav_countof(pWav->msadpcm.cachedFrames) - (pWav->msadpcm.cachedFrameCount*pWav->channels)) + iSample];
                 }
 
                 pBufferOut += pWav->channels;
@@ -6929,10 +6923,10 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
                 }
                 pWav->ima.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
 
-                if (header[2] >= drwav_countof(stepTable)) {
-                    drwav__adpcm_skip(pWav, pWav->ima.bytesRemainingInBlock);
-                    pWav->ima.bytesRemainingInBlock = 0;
-                    return totalFramesRead; /* Invalid data. */
+                /* A block whose step index is out of range is damaged: it keeps its frames in the timeline, as silence, and the blocks after it play. */
+                pWav->ima.silentBlock = (header[2] >= drwav_countof(stepTable));
+                if (pWav->ima.silentBlock) {
+                    header[2] = 0;
                 }
 
                 pWav->ima.predictor[0] = (drwav_int16)drwav_bytes_to_u16(header + 0);
@@ -6947,10 +6941,11 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
                 }
                 pWav->ima.bytesRemainingInBlock = pWav->fmt.blockAlign - sizeof(header);
 
-                if (header[2] >= drwav_countof(stepTable) || header[6] >= drwav_countof(stepTable)) {
-                    drwav__adpcm_skip(pWav, pWav->ima.bytesRemainingInBlock);
-                    pWav->ima.bytesRemainingInBlock = 0;
-                    return totalFramesRead; /* Invalid data. */
+                /* As for mono. */
+                pWav->ima.silentBlock = (header[2] >= drwav_countof(stepTable) || header[6] >= drwav_countof(stepTable));
+                if (pWav->ima.silentBlock) {
+                    header[2] = 0;
+                    header[6] = 0;
                 }
 
                 pWav->ima.predictor[0] = drwav_bytes_to_s16(header + 0);
@@ -6969,7 +6964,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
             if (pBufferOut != NULL) {
                 drwav_uint32 iSample;
                 for (iSample = 0; iSample < pWav->channels; iSample += 1) {
-                    pBufferOut[iSample] = (drwav_int16)pWav->ima.cachedFrames[(drwav_countof(pWav->ima.cachedFrames) - (pWav->ima.cachedFrameCount*pWav->channels)) + iSample];
+                    pBufferOut[iSample] = pWav->ima.silentBlock ? 0 : (drwav_int16)pWav->ima.cachedFrames[(drwav_countof(pWav->ima.cachedFrames) - (pWav->ima.cachedFrameCount*pWav->channels)) + iSample];
                 }
                 pBufferOut += pWav->channels;
             }
