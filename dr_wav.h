@@ -2043,12 +2043,18 @@ DRWAV_PRIVATE drwav_result drwav__read_chunk_header(drwav_read_proc onRead, void
     return DRWAV_SUCCESS;
 }
 
-DRWAV_PRIVATE drwav_bool32 drwav__seek_forward(drwav_seek_proc onSeek, drwav_uint64 offset, void* pUserData)
+/*
+Seeks forward, in steps of up to 2 GB since a seek's offset is an int. A seek past the end of a stream can succeed, as it does for a file, so
+each whole step is followed by a 1-byte read that fails at the end: an offset no stream could hold, which a damaged chunk size can give,
+then takes a few steps, not billions.
+*/
+DRWAV_PRIVATE drwav_bool32 drwav__seek_forward(drwav_read_proc onRead, drwav_seek_proc onSeek, drwav_uint64 offset, void* pUserData)
 {
     drwav_uint64 bytesRemainingToSeek = offset;
     while (bytesRemainingToSeek > 0) {
         if (bytesRemainingToSeek > 0x7FFFFFFF) {
-            if (!onSeek(pUserData, 0x7FFFFFFF, DRWAV_SEEK_CUR)) {
+            drwav_uint8 probe;
+            if (!onSeek(pUserData, 0x7FFFFFFF - 1, DRWAV_SEEK_CUR) || onRead(pUserData, &probe, 1) != 1) {
                 return DRWAV_FALSE;
             }
             bytesRemainingToSeek -= 0x7FFFFFFF;
@@ -2334,7 +2340,7 @@ DRWAV_PRIVATE drwav_uint64 drwav__read_smpl_to_metadata_obj(drwav__metadata_pars
         }
 
         if (trailingDataSizeInBytes > 0) {
-            if (!drwav__seek_forward(pParser->onSeek, trailingDataSizeInBytes, pParser->pReadSeekUserData)) {
+            if (!drwav__seek_forward(pParser->onRead, pParser->onSeek, trailingDataSizeInBytes, pParser->pReadSeekUserData)) {
                 return totalBytesRead;
             }
             totalBytesRead += trailingDataSizeInBytes;
@@ -3360,7 +3366,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         bytesRemainingInChunk = header.sizeInBytes + header.paddingSize;
 
         /* We don't care about the size of the RIFF chunk - skip it. */
-        if (!drwav__seek_forward(pWav->onSeek, 8, pWav->pUserData)) {
+        if (!drwav__seek_forward(pWav->onRead, pWav->onSeek, 8, pWav->pUserData)) {
             return DRWAV_FALSE;
         }
         bytesRemainingInChunk -= 8;
@@ -3384,7 +3390,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
 
         /* Skip over everything else. */
-        if (!drwav__seek_forward(pWav->onSeek, bytesRemainingInChunk, pWav->pUserData)) {
+        if (!drwav__seek_forward(pWav->onRead, pWav->onSeek, bytesRemainingInChunk, pWav->pUserData)) {
             return DRWAV_FALSE;
         }
         cursor += bytesRemainingInChunk;
@@ -3554,7 +3560,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             }
 
             if (header.paddingSize > 0) {
-                if (drwav__seek_forward(pWav->onSeek, header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
+                if (drwav__seek_forward(pWav->onRead, pWav->onSeek, header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
                     break;
                 }
                 cursor += header.paddingSize;
@@ -3583,7 +3589,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 break;      /* No need to keep reading beyond the data chunk. */
             } else {
                 chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
-                if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
+                if (drwav__seek_forward(pWav->onRead, pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
                     break;
                 }
                 cursor += chunkSize;
@@ -3626,7 +3632,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
             /* Seek to the next chunk in preparation for the next iteration. */
             chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
-            if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
+            if (drwav__seek_forward(pWav->onRead, pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
                 break;
             }
             cursor += chunkSize;
@@ -3749,7 +3755,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             after an AIFF's 18 bytes too. We need to seek past it, and past the padding byte of a chunk of odd size, which the name's
             length can give it.
             */
-            if (drwav__seek_forward(pWav->onSeek, (chunkSize - commDataBytesToRead) + header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
+            if (drwav__seek_forward(pWav->onRead, pWav->onSeek, (chunkSize - commDataBytesToRead) + header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
                 return DRWAV_FALSE;
             }
             cursor += (chunkSize - commDataBytesToRead) + header.paddingSize;
@@ -3796,7 +3802,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     One subtle detail here is that there is an offset with the SSND chunk. We need to make sure we seek past this offset
                     so we're left sitting on the first byte of actual audio data.
                     */
-                    if (drwav__seek_forward(pWav->onSeek, offset, pWav->pUserData) == DRWAV_FALSE) {
+                    if (drwav__seek_forward(pWav->onRead, pWav->onSeek, offset, pWav->pUserData) == DRWAV_FALSE) {
                         return DRWAV_FALSE;
                     }
                     cursor += offset;
@@ -3818,7 +3824,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 chunkSize += header.paddingSize;                /* <-- Make sure we seek past the padding. */
                 chunkSize -= sizeof(offsetAndBlockSizeData);    /* <-- This was read earlier. */
 
-                if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
+                if (drwav__seek_forward(pWav->onRead, pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
                     break;
                 }
                 cursor += chunkSize;
@@ -3845,7 +3851,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
         /* Make sure we skip past the content of this chunk before we go to the next one. */
         chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
-        if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
+        if (drwav__seek_forward(pWav->onRead, pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
             break;
         }
         cursor += chunkSize;
@@ -3922,7 +3928,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             }
 
             /* Move to the end of the chunk so we can keep iterating. */
-            if (drwav__seek_forward(pWav->onSeek, (header.sizeInBytes + header.paddingSize) - metadataBytesRead, pWav->pUserData) == DRWAV_FALSE) {
+            if (drwav__seek_forward(pWav->onRead, pWav->onSeek, (header.sizeInBytes + header.paddingSize) - metadataBytesRead, pWav->pUserData) == DRWAV_FALSE) {
                 drwav_free(metadataParser.pMetadata, &pWav->allocationCallbacks);
                 return DRWAV_FALSE;
             }
@@ -6429,9 +6435,18 @@ DRWAV_API drwav_bool32 drwav_seek_to_pcm_frame(drwav* pWav, drwav_uint64 targetF
         }
 
         while (offset > 0) {
-            /* Whole frames at a time, or a seek of more than INT_MAX bytes leaves the cursor part way into a frame. */
+            /*
+            Whole frames at a time, or a seek of more than INT_MAX bytes leaves the cursor part way into a frame. A step with more to follow
+            ends in a 1-byte read that fails at the end of the stream: without onTell the frame count isn't bounded by the stream's size,
+            and a seek into a length no stream could hold would otherwise take billions of steps.
+            */
             int offset32 = ((offset > INT_MAX) ? (int)((INT_MAX / bytesPerFrame) * bytesPerFrame) : (int)offset);
-            if (!pWav->onSeek(pWav->pUserData, offset32, DRWAV_SEEK_CUR)) {
+            if ((drwav_uint64)offset32 < offset) {
+                drwav_uint8 probe;
+                if (!pWav->onSeek(pWav->pUserData, offset32 - 1, DRWAV_SEEK_CUR) || pWav->onRead(pWav->pUserData, &probe, 1) != 1) {
+                    return DRWAV_FALSE;
+                }
+            } else if (!pWav->onSeek(pWav->pUserData, offset32, DRWAV_SEEK_CUR)) {
                 return DRWAV_FALSE;
             }
 
