@@ -5259,7 +5259,7 @@ static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_sub
     if (!drflac__read_uint8(bs, 2, &residualMethod) || (residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE && residualMethod != DRFLAC_RESIDUAL_CODING_METHOD_PARTITIONED_RICE2)) {
         return DRFLAC_FALSE;
     }
-    if (!drflac__read_uint8(bs, 4, &partitionOrder) || partitionOrder > 8 || (blockSize >> partitionOrder) < order) {
+    if (!drflac__read_uint8(bs, 4, &partitionOrder) || partitionOrder > 8 || (blockSize >> partitionOrder) < order || (blockSize & ((1U << partitionOrder) - 1)) != 0) {
         return DRFLAC_FALSE;
     }
 
@@ -5288,7 +5288,7 @@ static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_sub
 
         for (n = 0; n < count; ++n, ++i) {
             drflac_int32 residual = 0;
-            drflac_int64 prediction = 0;
+            drflac_uint64 prediction = 0;   /* Unsigned, so a damaged stream wraps rather than overflows. */
 
             if (isEscaped) {
                 if (unencodedBitsPerSample > 0 && !drflac__read_int32(bs, unencodedBitsPerSample, &residual)) {
@@ -5306,9 +5306,9 @@ static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_sub
             }
 
             for (j = 0; j < order; ++j) {
-                prediction += (drflac_int64)coefficients[j] * pSamples[i - j - 1];
+                prediction += (drflac_uint64)(drflac_int64)coefficients[j] * (drflac_uint64)pSamples[i - j - 1];
             }
-            pSamples[i] = residual + (prediction >> shift);
+            pSamples[i] = (drflac_int64)((drflac_uint64)(drflac_int64)residual + (drflac_uint64)((drflac_int64)prediction >> shift));
         }
     }
 
@@ -5317,7 +5317,8 @@ static drflac_bool32 drflac__decode_subframe_s64(drflac_bs* bs, const drflac_sub
 
 /*
 Replaces a stereo frame of a 32-bit stream whose side channel was decoded to 64 bits with its left and right channels, each of which fits in
-32 bits again, as independent channels in the decoded sample buffer. Each channel's wasted bits are applied here.
+32 bits again, as independent channels in the decoded sample buffer. Each channel's wasted bits are applied here. It's unsigned arithmetic,
+so a damaged frame wraps rather than overflows.
 */
 static void drflac__decorrelate_frame_with_33_bit_side(drflac* pFlac)
 {
@@ -5335,16 +5336,16 @@ static void drflac__decorrelate_frame_with_33_bit_side(drflac* pFlac)
 
         if (pFrame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_LEFT_SIDE) {
             left  = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel0[i] << shift0);
-            right = left - (drflac_int64)((drflac_uint64)pSide[i] << shift1);
+            right = (drflac_int64)((drflac_uint64)left - ((drflac_uint64)pSide[i] << shift1));
         } else if (pFrame->header.channelAssignment == DRFLAC_CHANNEL_ASSIGNMENT_RIGHT_SIDE) {
             right = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel1[i] << shift1);
-            left  = (drflac_int64)((drflac_uint64)pSide[i] << shift0) + right;
+            left  = (drflac_int64)(((drflac_uint64)pSide[i] << shift0) + (drflac_uint64)right);
         } else {
             drflac_int64 side = (drflac_int64)((drflac_uint64)pSide[i] << shift1);
             drflac_int64 mid  = (drflac_int64)((drflac_uint64)(drflac_int64)pChannel0[i] << shift0);
             mid   = (drflac_int64)(((drflac_uint64)mid << 1) | (drflac_uint64)(side & 1));
-            left  = (mid + side) >> 1;
-            right = (mid - side) >> 1;
+            left  = (drflac_int64)((drflac_uint64)mid + (drflac_uint64)side) >> 1;
+            right = (drflac_int64)((drflac_uint64)mid - (drflac_uint64)side) >> 1;
         }
 
         pChannel0[i] = (drflac_int32)left;
