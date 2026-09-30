@@ -1982,7 +1982,7 @@ DRWAV_PRIVATE unsigned int drwav__chunk_padding_size_riff(drwav_uint64 chunkSize
 
 DRWAV_PRIVATE unsigned int drwav__chunk_padding_size_w64(drwav_uint64 chunkSize)
 {
-    return (unsigned int)(chunkSize % 8);
+    return (unsigned int)((8 - (chunkSize % 8)) % 8);   /* The bytes that bring the chunk to the next multiple of 8. */
 }
 
 DRWAV_PRIVATE unsigned int drwav_calculate_padding_size(drwav_container container, drwav_uint64 chunkSize)
