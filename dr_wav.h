@@ -3964,12 +3964,23 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             totalBlockHeaderSizeInBytes = blockCount * (((pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) ? 6 : 4) * fmt.channels);
             if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
                 framesInDataKnown = DRWAV_FALSE;
-            } else {
+            } else if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
                 framesInData = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
+            } else {
+                /*
+                An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample, and the
+                rest of the block is groups of 4 bytes a channel, 8 frames a group, so a block cut short holds only its whole groups.
+                */
+                drwav_uint64 groupSizeInBytes = 4 * (drwav_uint64)fmt.channels;
+                drwav_uint64 bytesInPartialBlock = dataChunkSize % fmt.blockAlign;
 
-                /* An IMA block's header includes a decoded sample for each channel which acts as the initial predictor sample. */
-                if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
-                    framesInData += blockCount;
+                if (fmt.blockAlign < groupSizeInBytes) {
+                    framesInDataKnown = DRWAV_FALSE;
+                } else {
+                    framesInData = (dataChunkSize / fmt.blockAlign) * ((((fmt.blockAlign - groupSizeInBytes) * 2) / fmt.channels) + 1);
+                    if (bytesInPartialBlock >= groupSizeInBytes) {
+                        framesInData += 1 + ((bytesInPartialBlock - groupSizeInBytes) / groupSizeInBytes) * 8;
+                    }
                 }
             }
         }
