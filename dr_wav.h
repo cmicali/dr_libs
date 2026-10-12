@@ -289,10 +289,10 @@ typedef drwav_int32 drwav_result;
 
 /* Flags to pass into drwav_init_ex(), etc. */
 #define DRWAV_SEQUENTIAL            0x00000001
+#define DRWAV_WITH_METADATA         0x00000002
 
 /* AIFF-C ima4 packets between the decoder states kept for seeking: 4096 frames. */
 #define DRWAV_IMA4_PACKETS_PER_CHECKPOINT   64
-#define DRWAV_WITH_METADATA         0x00000002
 
 DRWAV_API void drwav_version(drwav_uint32* pMajor, drwav_uint32* pMinor, drwav_uint32* pRevision);
 DRWAV_API const char* drwav_version_string(void);
@@ -971,7 +971,7 @@ typedef struct
     /*
     AIFF-C ima4 only. An ima4 packet's decode depends on the decoder's state at its start, which only decoding every packet before it
     gives, so the state is recorded every DRWAV_IMA4_PACKETS_PER_CHECKPOINT packets as they are decoded, for seeks to start from.
-    Each checkpoint is a predictor and step index a channel. Kept apart from ima, which seeking back to the start clears.
+    Each checkpoint is a predictor and step index a channel. Kept apart from ima, which a seek clears.
     */
     drwav_int32* pIMA4Checkpoints;
     drwav_uint64 ima4CheckpointCount;
@@ -1205,8 +1205,8 @@ DRWAV_API drwav_uint64 drwav_read_pcm_frames_f32be(drwav* pWav, drwav_uint64 fra
 
 /*
 Reads and converts to IEEE 32-bit floating point samples as drwav_read_pcm_frames_f32() does, but one buffer a channel: ppFramesOut holds a
-pointer for each channel, each to room for framesToRead samples. Stereo PCM of 16, 24 or 32 bits and 32-bit floats convert straight into
-the two buffers; every other format is converted interleaved and split.
+pointer for each channel, each to room for framesToRead samples. With NEON, stereo PCM of 16, 24 or 32 bits and 32-bit floats convert
+straight into the two buffers. Every other format, and every format without NEON, is converted interleaved and split.
 
 Returns the number of PCM frames actually read.
 */
@@ -3417,8 +3417,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
 
     /*
-    The stream's size, where it can be found, bounds the chunk walk: a chunk that claims to run past the end of the stream ends the walk,
-    rather than being skipped. A skip is made 2 GB at a time, so a W64 chunk of a 64-bit size could otherwise take billions of seeks.
+    The stream's size, where it can be found, bounds the chunk walk. A chunk that claims to run past the end of the stream ends the walk
+    rather than being skipped.
     */
     if (!sequential && pWav->onTell != NULL) {
         drwav_int64 size;
@@ -3638,7 +3638,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
             /*
             If we're running in sequential mode, or we're not reading metadata and have found the fmt chunk, we have enough now that we can
-            get out of the loop. A fmt chunk after the data chunk is legal, if unusual, and is looked for past it.
+            get out of the loop. The WAVE format puts the fmt chunk before the data chunk. A file that breaks this is still read: its fmt chunk is
+    looked for past the data chunk.
             */
             if (sequential || (!isProcessingMetadata && foundChunk_fmt) || chunkRunsPastEnd) {
                 break;      /* No need to keep reading beyond the data chunk. */
@@ -3790,7 +3791,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
             if (compressionFormat == DR_WAVE_FORMAT_DVI_ADPCM) {
                 fmt.bitsPerSample  = 4;
-                fmt.blockAlign     = (drwav_uint16)(34 * (drwav_uint32)fmt.channels);   /* A block is a packet of every channel. */
+                fmt.blockAlign     = (drwav_uint16)(34 * (drwav_uint32)fmt.channels);   /* A block is one packet: 34 bytes for each channel. */
                 fmt.avgBytesPerSec = (drwav_uint32)(((drwav_uint64)fmt.blockAlign * fmt.sampleRate) / 64);
             }
 
@@ -3932,8 +3933,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     }
 
     /*
-    The sample count in the "fact" chunk is either unreliable, or I'm not understanding it properly. For now I am only enabling this
-    for Microsoft ADPCM formats.
+    A RIFF "fact" chunk's sample count is used only for Microsoft ADPCM. For other formats it is either unreliable, or I'm not
+    understanding it properly. A W64 fact count and an RF64 ds64 count are used for every format.
     */
     if ((pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
         sampleCountFromFactChunk = riffFactSampleCount;
@@ -4072,14 +4073,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     pWav->translatedFormatTag = translatedFormatTag;
 
     /*
-    I've had a report where files would start glitching after seeking. The reason for this is the data
-    chunk is not a clean multiple of the PCM frame size in bytes. Where this becomes a problem is when
-    seeking, because the number of bytes remaining in the data chunk is used to calculate the current
-    byte position. If this byte position is not aligned to the number of bytes in a PCM frame, it will
-    result in the seek not being cleanly positioned at the start of the PCM frame thereby resulting in
-    all decoded frames after that being corrupted.
-
-    To address this, we need to round the data chunk size down to the nearest multiple of the frame size.
+    The data chunk need not hold a whole number of PCM frames. Its size is rounded down to the nearest
+    multiple of the frame size, so a partial frame at its end is never read as audio.
     */
     if (!drwav__is_compressed_format_tag(translatedFormatTag)) {
         drwav_uint32 bytesPerFrame = drwav_get_bytes_per_pcm_frame(pWav);
@@ -4163,9 +4158,9 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     }
 
     /*
-    A WAV ADPCM block must hold its header, and an IMA ADPCM one whole groups of 4 bytes a channel after it: the readers count a block's
-    bytes down by header and group, and a count that went below 0 would wrap, and the blocks after it be read out of step. An MS ADPCM
-    stream needs a coefficient pair for its blocks' predictors to index.
+    A WAV ADPCM block must hold its header. An IMA ADPCM block must also hold at least one group of 4 bytes a channel after it, and only
+    whole groups. The readers count a block's bytes down by header and group. A count that went below 0 would wrap, and the blocks after
+    it would be read out of step. An MS ADPCM stream needs a coefficient pair for its blocks' predictors to index.
     */
     if (pWav->container != drwav_container_aiff) {
         drwav_uint32 blockAlign = fmt.blockAlign;
@@ -4195,7 +4190,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         pWav->msadpcmCoefficientCount = msadpcmCoefficientCount;
     }
 
-    /* Without room for its read-ahead an ADPCM stream is read a few bytes at a time, as it used to be. */
+    /* Without room for its read-ahead, an ADPCM stream is read from the stream a few bytes at a time. */
     if (drwav__is_compressed_format_tag(pWav->translatedFormatTag)) {
         drwav_uint32 capacity = (fmt.blockAlign > 16384) ? fmt.blockAlign : 16384;
         pWav->pADPCMBuffer = (drwav_uint8*)drwav__malloc_from_callbacks(capacity, &pWav->allocationCallbacks);
@@ -6956,7 +6951,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
         /* If there are no cached samples we need to load a new block. */
         if (pWav->ima.cachedFrameCount == 0 && pWav->ima.bytesRemainingInBlock == 0) {
             if (pWav->container == drwav_container_aiff) {
-                /* AIFF-C ima4. A packet of every channel, each decoded whole into the cache. */
+                /* AIFF-C ima4. One packet, 34 bytes for each channel, each channel's part decoded whole into the cache. */
                 drwav_uint8 packet[68];
                 drwav_uint32 packetSize = 34 * pWav->channels;
                 if (drwav__adpcm_read(pWav, packet, packetSize) != packetSize) {
@@ -6983,9 +6978,10 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
                     drwav_uint32 iSample;
 
                     /*
-                    The header holds the encoder's state to 9 bits. A decoder in step with the encoder keeps its own, exact state, and the
-                    header takes over only when the two are further apart than that precision allows, at the start or after damage. This
-                    is what CoreAudio does: decoding each packet from its header alone differs from it in nearly every sample.
+                    The header holds the encoder's predictor to its top 9 bits, and its exact step index. A decoder in step with the
+                    encoder keeps its own, exact predictor. The header takes over only when the step indexes differ or the predictors are
+                    further apart than 9 bits allow: at the start, or after damage. This is what CoreAudio does. Decoding each packet from
+                    its header alone differs from it in nearly every sample.
                     */
                     if (pWav->ima.stepIndex[iChannel] != headerStepIndex || distance > 0x7F || distance < -0x7F) {
                         pWav->ima.predictor[iChannel] = headerPredictor;
@@ -7743,8 +7739,9 @@ static DRWAV_INLINE float drwav__pcm_sample_to_f32(const drwav_uint8* p, unsigne
 Converts samples of 1 to 4 bytes, little- or big-endian, to f32: signed integers scaled by 1/2^(bits-1), unsigned 8-bit ones centred on 128
 first, and 32-bit floats copied. Every result is exact but for 32-bit integers, which are rounded to the nearest float.
 
-pIn may lie inside pOut's own samples, no earlier than their start. Each sample's output then ends no later than the input still to be read,
-so the conversion can run front to back in place, which the vector loops keep by loading a block's input before storing its output.
+pIn may lie inside pOut's own samples if it is at least sampleCount * (4 - bytesPerSample) bytes past pOut, as
+drwav_read_pcm_frames_f32__direct() places it. Each sample's output then ends no later than the input still to be read. So the conversion
+can run front to back in place. The vector loops keep this by loading a block's input before storing its output.
 */
 DRWAV_PRIVATE void drwav__pcm_to_f32_ex(float* pOut, const drwav_uint8* pIn, size_t sampleCount, unsigned int bytesPerSample, drwav_bool32 isBigEndian, int kind)
 {
