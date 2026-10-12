@@ -5936,6 +5936,7 @@ static drflac_bool32 drflac__seek_subframe(drflac_bs* bs, drflac_frame* frame, i
         case DRFLAC_SUBFRAME_LPC:
         {
             drflac_uint8 lpcPrecision;
+            drflac_int8 lpcShift;
 
             unsigned int bitsToSeek = pSubframe->lpcOrder * subframeBitsPerSample;
             if (!drflac__seek_bits(bs, bitsToSeek)) {
@@ -5950,8 +5951,11 @@ static drflac_bool32 drflac__seek_subframe(drflac_bs* bs, drflac_frame* frame, i
             }
             lpcPrecision += 1;
 
+            if (!drflac__read_int8(bs, 5, &lpcShift) || lpcShift < 0) {
+                return DRFLAC_FALSE;    /* Negative shifts are not supported. See drflac__decode_samples__lpc(). */
+            }
 
-            bitsToSeek = (pSubframe->lpcOrder * lpcPrecision) + 5;    /* +5 for shift. */
+            bitsToSeek = pSubframe->lpcOrder * lpcPrecision;
             if (!drflac__seek_bits(bs, bitsToSeek)) {
                 return DRFLAC_FALSE;
             }
@@ -6060,8 +6064,8 @@ static drflac_result drflac__seek_flac_frame(drflac* pFlac)
     pFlac->currentFLACFrame.pcmFramesRemaining = 0;
 
     /*
-    The frame header checks drflac__decode_flac_frame() makes are made here too, so passing over frames and decoding them agree on where each
-    one is. A negative LPC shift is not checked here, so a frame with one is passed over here but fails to decode.
+    The frame header checks drflac__decode_flac_frame() makes are made here too, and drflac__seek_subframe() refuses a negative LPC shift as
+    decoding does, so passing over frames and decoding them agree on where each one is.
     */
     channelCount = drflac__get_channel_count_from_channel_assignment(pFlac->currentFLACFrame.header.channelAssignment);
     if (pFlac->currentFLACFrame.header.blockSizeInPCMFrames > pFlac->maxBlockSizeInPCMFrames || channelCount != (int)pFlac->channels) {
