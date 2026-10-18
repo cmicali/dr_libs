@@ -3303,9 +3303,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 /*return DRWAV_FALSE;*/    /* Chunk size should always be at least 36 bytes. */
             }
         } else if (pWav->container == drwav_container_rf64) {
-            if (drwav_bytes_to_u32_le(chunkSizeBytes) != 0xFFFFFFFF) {
-                return DRWAV_FALSE;    /* Chunk size should always be set to -1/0xFFFFFFFF for RF64. The actual size is retrieved later. */
-            }
+            /* The size should be 0xFFFFFFFF, and ds64 holds the real one. A real size here is accepted too, as CoreAudio and EBU's own test files do. */
         } else {
             return DRWAV_FALSE; /* Should never hit this. */
         }
