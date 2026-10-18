@@ -3522,7 +3522,13 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             fmt.channelMask        = 0;
             DRWAV_ZERO_MEMORY(fmt.subFormat, sizeof(fmt.subFormat));
 
-            if (header.sizeInBytes > 16) {
+            if (header.sizeInBytes > 16 && header.sizeInBytes < 18) {
+                /* Too short for cbSize: the byte past the 16 is skipped, as CoreAudio does. Read as cbSize, it took in the pad byte and the leftover wrapped. */
+                if (pWav->onSeek(pWav->pUserData, (int)(header.sizeInBytes - 16), DRWAV_SEEK_CUR) == DRWAV_FALSE) {
+                    return DRWAV_FALSE;
+                }
+                cursor += header.sizeInBytes - 16;
+            } else if (header.sizeInBytes > 16) {
                 drwav_uint8 fmt_cbSize[2];
                 int bytesReadSoFar = 0;
                 drwav_uint64 leftoverBytes;
